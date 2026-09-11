@@ -1,0 +1,19 @@
+# The `simple-english` TUI status widget.
+#
+# Reads `<session>/simple-english-state.json` and renders a single-line
+# status in the row slot above the input box:
+#   " Writing-rule reply: n hard, m soft "
+#
+# The row is shown only when the state file exists and has been written
+# by the `harness-hook-simple-english` run.idle handler. When no state
+# is present, no row is rendered.
+#
+# Build: `cargo build` in this directory. The binary lands in
+# ./target/debug/simple-english-ext. The manifest addresses it by a
+# path relative to its own entry; the host resolves that against the
+# entry directory (docs/ui-extension.md section 6).
+
+[ext]
+command = "target/debug/simple-english-ext"
+caps = ["row"]
+protocol_v = 1

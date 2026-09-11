@@ -10,8 +10,9 @@ prose, file edits, and git commit messages.
 
 | Window         | Behaviour                                                       |
 |----------------|-----------------------------------------------------------------|
-| `tool.before`  | Lints `write`, `edit`, and `bash` (git commit) calls.          |
-| `model.before` | Injects the active rule summary into the prompt fragment.       |
+| `tool.before`  | Lints `write`, `edit`, and `bash` (git commit) calls with diff-aware filtering. |
+| `model.before` | Injects the active rule summary and any pending reply-gate feedback into the prompt fragment. |
+| `run.idle`     | Lints the last assistant reply. Gates the loop on hard violations. |
 
 ## Rules
 
@@ -43,6 +44,32 @@ Place `.simple-english.json` in the project root or set
 }
 ```
 
+## Diff-aware linting
+
+`write` and `edit` calls are linted against the previous file content on
+disk. Only violations on lines that changed are reported; pre-existing
+violations on untouched lines are suppressed. New files (no previous
+content) are linted in full.
+
+## Reply gating (`run.idle`)
+
+When the loop goes idle, the hook lints the last assistant reply. If
+hard violations are found, it emits a `continue` decision with a
+correction prompt so the model rewrites its reply. Each reply identity
+can be gated at most once (max 3 consecutive gates) to prevent infinite
+loops.
+
+State is persisted in `<session>/simple-english-state.json`.
+
+## TUI status widget
+
+The `simple-english-ext/` subdirectory contains a TUI extension that
+reads the state file and renders a one-line status in the row slot:
+
+    Writing-rule reply: n hard, m soft
+
+Red when hard > 0, yellow when soft-only, green when clean.
+
 ## Registration
 
 In `config.toml`:
@@ -55,7 +82,20 @@ command = "harness-hook-simple-english"
 [[hooks.on]]
 window  = "model.before"
 command = "harness-hook-simple-english"
+
+[[hooks.on]]
+window  = "run.idle"
+command = "harness-hook-simple-english"
 ```
+
+For the TUI widget, place (or symlink) `simple-english-ext/` under
+`ui_extensions/simple-english/` in the extensions tree and build it:
+
+```sh
+cd simple-english-ext && cargo build --release
+```
+
+The binary lands in `simple-english-ext/target/debug/simple-english-ext`.
 
 ## Build
 
@@ -63,4 +103,4 @@ command = "harness-hook-simple-english"
 cargo build --release
 ```
 
-The binary lands in `target/release/harness-hook-simple-english`.
+The hook binary lands in `target/release/harness-hook-simple-english`.
