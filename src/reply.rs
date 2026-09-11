@@ -10,9 +10,12 @@
 //!
 //! State file: `<session>/simple-english-state.json`
 
-use serde::{Deserialize, Serialize};
 use std::fs;
+use std::hash::Hasher;
 use std::path::Path;
+
+use fnv::FnvHasher;
+use serde::{Deserialize, Serialize};
 
 /// On-disk state persisted per session.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -110,14 +113,9 @@ pub fn read_last_assistant_message(dir: &Path) -> Option<String> {
 /// Stable FNV-1a 64-bit identity for a reply text. Deterministic across
 /// process runs (unlike `DefaultHasher` with random state).
 pub fn reply_identity(content: &str) -> String {
-    const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
-    const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
-    let mut hash: u64 = FNV_OFFSET;
-    for b in content.bytes() {
-        hash ^= b as u64;
-        hash = hash.wrapping_mul(FNV_PRIME);
-    }
-    format!("{hash:016x}")
+    let mut hasher = FnvHasher::default();
+    hasher.write(content.as_bytes());
+    format!("{:016x}", hasher.finish())
 }
 
 #[cfg(test)]

@@ -28,6 +28,8 @@ serde_json = "1.0"
 regex = "1"
 similar = "3.2.0"
 split-paragraphs = "1.0.0"
+fnv = "1.0.7"
+shlex = "2.0.1"
 
 [dev-dependencies]
 tempfile = "3"

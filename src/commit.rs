@@ -4,6 +4,10 @@
 //! project: detects `git commit` invocations, extracts the `-m` /
 //! `--message` argument, and flags dynamic messages (containing `$` or
 //! backticks) that cannot be statically checked.
+//!
+//! Shell tokenization uses the `shlex` crate.
+
+use shlex::split as shlex_split;
 
 /// A single extracted commit-message fragment.
 #[derive(Debug, Clone)]
@@ -30,7 +34,10 @@ pub fn find_commit_invocations(command: &str) -> Vec<CommitMessage> {
 
     // Simple state-machine scan for `git commit` followed by optional
     // flags, then a `-m <msg>` or `--message=<msg>` argument.
-    let tokens = tokenize_shell(command);
+    let Some(tokens) = shlex_split(command) else {
+        // Unparseable command: skip commit linting for this call.
+        return Vec::new();
+    };
 
     let mut i = 0;
     while i < tokens.len() {
@@ -78,42 +85,6 @@ pub fn find_commit_invocations(command: &str) -> Vec<CommitMessage> {
     }
 
     out
-}
-
-/// Very small shell-tokeniser: splits on whitespace, preserves quoted
-/// strings as single tokens, does not expand variables.
-fn tokenize_shell(cmd: &str) -> Vec<String> {
-    let mut tokens: Vec<String> = Vec::new();
-    let mut cur = String::new();
-    let mut in_single = false;
-    let mut in_double = false;
-
-    for c in cmd.chars() {
-        match c {
-            '\'' if !in_double => {
-                in_single = !in_single;
-            }
-            '"' if !in_single => {
-                in_double = !in_double;
-            }
-            ch if !in_single && !in_double => match ch {
-                ' ' | '\t' | ';' | '&' => {
-                    if !cur.is_empty() {
-                        tokens.push(std::mem::take(&mut cur));
-                    }
-                }
-                _ => cur.push(ch),
-            },
-            _ => {
-                cur.push(c);
-            }
-        }
-    }
-    if !cur.is_empty() {
-        tokens.push(cur);
-    }
-
-    tokens
 }
 
 #[cfg(test)]
