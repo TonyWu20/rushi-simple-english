@@ -6,12 +6,14 @@
 //! pre-existing code.
 //!
 //! This module fixes that: it computes which *lines of the new content*
-//! actually changed relative to the previous content, lints the full new
-//! content, then discards any violation that lands on an unchanged line.
-//! New files (no previous content) are linted in full.
+//! actually changed relative to the previous content (via the `similar`
+//! crate), lints the full new content, then discards any violation that
+//! lands on an unchanged line. New files (no previous content) are
+//! linted in full.
 
 use crate::engine;
 use crate::types::{LintConfig, LintKind, LintReport, LintSummary, Severity, Violation};
+use similar::{DiffTag, TextDiff};
 
 /// Lint `new_content`, keeping only violations on lines that changed
 /// relative to `old_content`. When `old_content` is `None` (a brand-new
@@ -80,90 +82,21 @@ pub fn apply_edit(
 }
 
 /// Return the 1-based line numbers in `new` that differ from `old`.
+///
+/// Uses the `similar` crate's line-level diff. An `Insert` or `Replace`
+/// op marks its new-side line range as changed; an `Equal` op leaves
+/// its lines untouched. `Delete` ops touch only the old side.
 fn changed_lines(old: &str, new: &str) -> std::collections::HashSet<usize> {
-    let old_lines: Vec<&str> = old.lines().collect();
-    let new_lines: Vec<&str> = new.lines().collect();
-
-    if old_lines.is_empty() && new_lines.is_empty() {
-        return std::collections::HashSet::new();
-    }
-    if old_lines.is_empty() {
-        return (1..=new_lines.len()).collect();
-    }
-
-    // LCS is exact but O(n*m); fall back to the cheap prefix/suffix
-    // heuristic when either side is large.
-    const CELL_CAP: u64 = 4_000_000;
-    let n = old_lines.len() as u64;
-    let m = new_lines.len() as u64;
-    if n * m > CELL_CAP {
-        return prefix_suffix_changed(&old_lines, &new_lines);
-    }
-
-    lcs_changed(&old_lines, &new_lines)
-}
-
-/// Exact changed-line set via LCS over the two line arrays.
-fn lcs_changed(old: &[&str], new: &[&str]) -> std::collections::HashSet<usize> {
-    let n = old.len();
-    let m = new.len();
-    let cols = m + 1;
-    let mut dp = vec![0u32; (n + 1) * cols];
-
-    for i in 1..=n {
-        for j in 1..=m {
-            let match_len = if old[i - 1] == new[j - 1] {
-                dp[(i - 1) * cols + j - 1] + 1
-            } else {
-                dp[(i - 1) * cols + j].max(dp[i * cols + j - 1])
-            };
-            dp[i * cols + j] = match_len;
+    let diff = TextDiff::from_lines(old, new);
+    let mut changed = std::collections::HashSet::new();
+    for op in diff.ops() {
+        if matches!(op.tag(), DiffTag::Insert | DiffTag::Replace) {
+            for line in op.new_range() {
+                changed.insert(line + 1); // 1-based
+            }
         }
     }
-
-    // Walk back, marking new-lines that are part of the alignment.
-    let mut i = n;
-    let mut j = m;
-    let mut matched = vec![false; m];
-    while i > 0 && j > 0 {
-        if old[i - 1] == new[j - 1] {
-            matched[j - 1] = true;
-            i -= 1;
-            j -= 1;
-        } else if dp[(i - 1) * cols + j] >= dp[i * cols + j - 1] {
-            i -= 1;
-        } else {
-            j -= 1;
-        }
-    }
-
-    (0..m)
-        .filter(|&idx| !matched[idx])
-        .map(|idx| idx + 1)
-        .collect()
-}
-
-/// Cheap fallback: changed lines are the ones between the common prefix
-/// and the common suffix.
-fn prefix_suffix_changed(old: &[&str], new: &[&str]) -> std::collections::HashSet<usize> {
-    let n = old.len();
-    let m = new.len();
-
-    let mut prefix = 0usize;
-    while prefix < n && prefix < m && old[prefix] == new[prefix] {
-        prefix += 1;
-    }
-    let mut suffix = 0usize;
-    while suffix < n - prefix && suffix < m - prefix && old[n - 1 - suffix] == new[m - 1 - suffix] {
-        suffix += 1;
-    }
-
-    let start = prefix + 1; // 1-based
-    let end = m.saturating_sub(suffix) + 1; // 1-based inclusive
-    if start > end {
-        return std::collections::HashSet::new();
-    }
-    (start..=end).collect()
+    changed
 }
 
 /// Keep only violations whose 1-based line is in `changed`.
