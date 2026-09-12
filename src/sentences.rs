@@ -89,40 +89,55 @@ pub fn segment_sentences(text: &str) -> Vec<Sentence> {
 }
 
 /// Returns `(start, end)` byte ranges in `line` where a sentence ends.
+///
+/// All returned indices are **byte offsets** on char boundaries, so the
+/// caller can slice the source string with `&line[last..end]` without
+/// panicking on multibyte characters.
 fn sentence_ends(line: &str) -> Vec<(usize, usize)> {
     let mut ends: Vec<(usize, usize)> = Vec::new();
-    let chars: Vec<char> = line.chars().collect();
+    let len = line.len();
     let mut i = 0usize;
 
-    while i < chars.len() {
-        match chars[i] {
-            '.' | '!' | '?' => {
-                let mut end = i + 1;
-                // Consume consecutive terminators: "..." "?!?!"
-                while end < chars.len() && matches!(chars[end], '.' | '!' | '?') {
-                    end += 1;
+    while i < len {
+        let ch = line[i..].chars().next().unwrap();
+        let ch_bytes = ch.len_utf8();
+        match ch {
+            '.' | '!' | '?' | '\u{3002}' | '\u{ff01}' | '\u{ff1f}' => {
+                let start = i;
+                let mut end = i + ch_bytes;
+                // Consume consecutive terminators: "..." "?!?!" "。！"
+                while end < len {
+                    let c = line[end..].chars().next().unwrap();
+                    if matches!(c, '.' | '!' | '?' | '\u{3002}' | '\u{ff01}' | '\u{ff1f}') {
+                        end += c.len_utf8();
+                    } else {
+                        break;
+                    }
                 }
                 // Consume closing delimiters
-                while end < chars.len()
-                    && CLOSING_DELIMS.contains(&chars[end])
-                {
-                    end += 1;
+                while end < len {
+                    let c = line[end..].chars().next().unwrap();
+                    if CLOSING_DELIMS.contains(&c) {
+                        end += c.len_utf8();
+                    } else {
+                        break;
+                    }
                 }
 
                 // Check if this is a known abbreviation (e.g. "e.g.")
-                let before: String = chars[..i].iter().collect();
+                let before = &line[..start];
                 let is_abbrev = ABBREVIATIONS.iter().any(|abbr| {
                     before.ends_with(abbr)
                 });
 
                 if !is_abbrev {
-                    ends.push((i, end));
+                    ends.push((start, end));
                 }
                 i = end;
                 continue;
             }
             _ => {
-                i += 1;
+                i += ch_bytes;
             }
         }
     }
@@ -277,5 +292,32 @@ mod tests {
     fn empty_text() {
         let sents = segment_sentences("");
         assert!(sents.is_empty());
+    }
+
+    /// Regression test: a line containing multibyte characters (e.g. the
+    /// ellipsis `…` and em-dash `—`) followed by a sentence terminator
+    /// must not panic on a char-boundary violation, and must still split
+    /// at the ASCII terminator after the multibyte run.
+    #[test]
+    fn multibyte_chars_before_terminator() {
+        let line = "- **`table_grid`** (rewritten) \u{2014} wide cells wrap, truncated with `\u{2026}`. A data row spans.";
+        let sents = segment_sentences(line);
+        // Two sentences: the first ends at the '.' after the ellipsis,
+        // the second is the tail. Before the byte-index fix this panicked
+        // because the char index was sliced as a byte index mid-'…'.
+        assert_eq!(sents.len(), 2);
+        assert_eq!(
+            sents[0].text,
+            "- **`table_grid`** (rewritten) \u{2014} wide cells wrap, truncated with `\u{2026}`."
+        );
+        assert_eq!(sents[1].text, "A data row spans.");
+    }
+
+    #[test]
+    fn cjk_sentence() {
+        let sents = segment_sentences("你好世界。这是测试！");
+        assert_eq!(sents.len(), 2);
+        assert_eq!(sents[0].text, "你好世界。");
+        assert_eq!(sents[1].text, "这是测试！");
     }
 }
