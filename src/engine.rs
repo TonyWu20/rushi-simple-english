@@ -121,7 +121,10 @@ pub fn lint(kind: LintKind, text: &str, config: &LintConfig) -> LintReport {
 }
 
 /// Extract prose lines from the source text based on the content kind.
-fn extract_prose_lines(kind: LintKind, text: &str) -> Vec<String> {
+///
+/// Exposed so `diff` can diff in the same prose coordinate system that
+/// the engine uses for `Violation.line`.
+pub(crate) fn extract_prose_lines(kind: LintKind, text: &str) -> Vec<String> {
     match kind {
         LintKind::ProseFile | LintKind::CommitMessage => {
             text.lines().map(String::from).collect()

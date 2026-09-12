@@ -18,13 +18,17 @@ use similar::{DiffTag, TextDiff};
 /// Lint `new_content`, keeping only violations on lines that changed
 /// relative to `old_content`. When `old_content` is `None` (a brand-new
 /// file), every line is treated as changed and all violations are kept.
+///
+/// The "changed" set is computed in *prose* coordinates (the extracted
+/// comment lines for source kinds), the same coordinate system the
+/// engine uses for `Violation.line`.
 pub fn lint_write(
     kind: LintKind,
     new_content: &str,
     old_content: Option<&str>,
     config: &LintConfig,
 ) -> LintReport {
-    let changed = changed_lines(old_content.unwrap_or(""), new_content);
+    let changed = changed_prose_lines(kind, old_content.unwrap_or(""), new_content);
     let report = engine::lint(kind, new_content, config);
     filter_to_changed(report, &changed)
 }
@@ -45,7 +49,7 @@ pub fn lint_edit(
     config: &LintConfig,
 ) -> Result<LintReport, String> {
     let new_content = apply_edit(file_content, old_string, new_string, replace_all)?;
-    let changed = changed_lines(file_content, &new_content);
+    let changed = changed_prose_lines(kind, file_content, &new_content);
     let report = engine::lint(kind, &new_content, config);
     Ok(filter_to_changed(report, &changed))
 }
@@ -81,13 +85,29 @@ pub fn apply_edit(
     Ok(result)
 }
 
-/// Return the 1-based line numbers in `new` that differ from `old`.
+/// Return the 1-based *prose line* numbers in `new` that differ from
+/// `old`, for a given content `kind`.
 ///
-/// Uses the `similar` crate's line-level diff. An `Insert` or `Replace`
-/// op marks its new-side line range as changed; an `Equal` op leaves
-/// its lines untouched. `Delete` ops touch only the old side.
-fn changed_lines(old: &str, new: &str) -> std::collections::HashSet<usize> {
-    let diff = TextDiff::from_lines(old, new);
+/// The engine reports `Violation.line` in *prose* coordinates: for the
+/// source kinds the prose is the extracted comment text, a compacted
+/// subset of the file, so the prose index is not the file line number.
+/// To filter violations against the lines an edit actually touched, the
+/// diff must therefore run over the extracted prose lines, not the raw
+/// file. Diffing raw file lines mixed the two coordinate systems and
+/// made pre-existing violations false-positive on unrelated edits.
+///
+/// Uses the `similar` crate's line-level diff over the joined prose text.
+/// An `Insert` or `Replace` op marks its new-side line range as changed;
+/// an `Equal` op leaves its lines untouched. `Delete` ops touch only the
+/// old side.
+fn changed_prose_lines(
+    kind: LintKind,
+    old: &str,
+    new: &str,
+) -> std::collections::HashSet<usize> {
+    let old_prose = engine::extract_prose_lines(kind, old).join("\n");
+    let new_prose = engine::extract_prose_lines(kind, new).join("\n");
+    let diff = TextDiff::from_lines(&old_prose, &new_prose);
     let mut changed = std::collections::HashSet::new();
     for op in diff.ops() {
         if matches!(op.tag(), DiffTag::Insert | DiffTag::Replace) {
@@ -127,7 +147,7 @@ mod tests {
     fn changed_lines_detects_middle_edit() {
         let old = "line one\nline two\nline three\n";
         let new = "line one\nline two CHANGED\nline three\n";
-        let changed = changed_lines(old, new);
+        let changed = changed_prose_lines(LintKind::ProseFile, old, new);
         assert!(changed.contains(&2), "line 2 changed");
         assert!(!changed.contains(&1), "line 1 unchanged");
         assert!(!changed.contains(&3), "line 3 unchanged");
@@ -135,14 +155,61 @@ mod tests {
 
     #[test]
     fn changed_lines_new_file_is_all() {
-        let changed = changed_lines("", "a\nb\nc\n");
+        let changed = changed_prose_lines(LintKind::ProseFile, "", "a\nb\nc\n");
         assert_eq!(changed, std::collections::HashSet::from([1usize, 2, 3]));
     }
 
     #[test]
     fn changed_lines_identical_is_empty() {
         let text = "same\nsame\n";
-        assert!(changed_lines(text, text).is_empty());
+        assert!(changed_prose_lines(LintKind::ProseFile, text, text).is_empty());
+    }
+
+    #[test]
+    fn slash_source_preexisting_violation_does_not_resurface() {
+        // A `.rs` file (SlashSource): the file-line numbers of the
+        // comments differ from the prose-line indices the engine reports.
+        // The semicolon is on a comment that the edit does not touch, so
+        // it must not resurface even though the edited file line number
+        // happens to match that prose index.
+        let config = LintConfig::default();
+        let old = "// intro\nfn main() {\n    let a = 1; // bad; semicolon\n}\n";
+        let report = lint_edit(
+            LintKind::SlashSource,
+            old,
+            "fn main() {",
+            "fn main2() {",
+            false,
+            &config,
+        )
+        .unwrap();
+        assert!(
+            report.violations.is_empty(),
+            "pre-existing semicolon on an unchanged prose line was kept: {report:?}"
+        );
+    }
+
+    #[test]
+    fn slash_source_new_violation_is_reported() {
+        // A new comment introduces a semicolon on a changed prose line.
+        let config = LintConfig::default();
+        let old = "fn main() {\n    let a = 1;\n}\n";
+        let report = lint_edit(
+            LintKind::SlashSource,
+            old,
+            "let a = 1;",
+            "let a = 1; // bad; note",
+            false,
+            &config,
+        )
+        .unwrap();
+        assert!(
+            report
+                .violations
+                .iter()
+                .any(|v| v.rule_id == "semicolon"),
+            "new semicolon on a changed prose line was dropped: {report:?}"
+        );
     }
 
     #[test]
