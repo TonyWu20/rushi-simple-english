@@ -15,6 +15,12 @@
 name = "hook-simple-english"
 version = "0.1.0"
 edition = "2021"
+description = "ASD-STE100 writing-rule hook for the rushi harness. Lints prose, diffs, and commit messages, and blocks hard violations on the tool.before and model.before hook windows."
+license = "MIT"
+repository = "https://github.com/TonyWu20/rushi-simple-english"
+keywords = ["cli", "hooks", "linting", "writing-rules", "simplified-english"]
+categories = ["command-line-utilities", "development-tools", "text-processing"]
+rust-version = "1.75"
 
 [workspace]
 
