@@ -8,12 +8,12 @@
 # by the `harness-hook-simple-english` run.idle handler. When no state
 # is present, no row is rendered.
 #
-# Build: `cargo build` in this directory. The binary lands in
-# ./target/debug/simple-english-ext. The manifest addresses it by a
+# Build: `cargo build --release` in this directory. The binary lands in
+# ./target/release/simple-english-ext. The manifest addresses it by a
 # path relative to its own entry; the host resolves that against the
 # entry directory (docs/ui-extension.md section 6).
 
 [ext]
-command = "target/debug/simple-english-ext"
+command = "target/release/simple-english-ext"
 caps = ["row"]
 protocol_v = 1

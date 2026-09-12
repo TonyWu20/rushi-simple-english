@@ -95,7 +95,7 @@ For the TUI widget, place (or symlink) `simple-english-ext/` under
 cd simple-english-ext && cargo build --release
 ```
 
-The binary lands in `simple-english-ext/target/debug/simple-english-ext`.
+The binary lands in `simple-english-ext/target/release/simple-english-ext`.
 
 ## Build
 
