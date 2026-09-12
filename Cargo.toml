@@ -20,7 +20,7 @@ license = "MIT"
 repository = "https://github.com/TonyWu20/rushi-simple-english"
 keywords = ["cli", "hooks", "linting", "writing-rules", "simplified-english"]
 categories = ["command-line-utilities", "development-tools", "text-processing"]
-rust-version = "1.75"
+rust-version = "1.85"
 
 [workspace]
 
