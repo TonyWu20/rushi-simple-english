@@ -303,4 +303,20 @@ mod tests {
                 .unwrap();
         assert_eq!(report.summary.total, 0, "{report:?}");
     }
+
+    #[test]
+    fn lint_edit_inside_inline_span_is_exempt() {
+        let config = LintConfig::default();
+        let file = "Title.\nUse `run a` now.\n";
+        let report = lint_edit(
+            LintKind::ProseFile,
+            file,
+            "run a",
+            "run a; run b",
+            false,
+            &config,
+        )
+        .unwrap();
+        assert_eq!(report.summary.total, 0, "{report:?}");
+    }
 }

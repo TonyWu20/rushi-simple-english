@@ -31,12 +31,13 @@ prose, file edits, and git commit messages.
 | `hedging`                       | soft     | "it is important to note", etc. |
 | `marketing`                     | soft     | "seamless", "robust", etc.      |
 
-## Code fences
+## Code exemption
 
-Prose and commit-message text skips fenced code blocks. A fence line
-starts with three or more backticks or tildes, with at most three
-leading spaces. Lines inside the fence are not linted. This keeps
-rules such as `semicolon` from tripping on code.
+Prose and commit-message text skips code. A fenced block starts with
+three or more backticks or tildes, with at most three leading
+spaces. Lines inside the fence are not linted. A backtick code span
+is also skipped. A span holds one line. This keeps rules such as
+`semicolon` from tripping on code.
 
 ## Config
 

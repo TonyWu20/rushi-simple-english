@@ -122,11 +122,11 @@ pub fn lint(kind: LintKind, text: &str, config: &LintConfig) -> LintReport {
 
 /// Extract prose lines from the source text based on the content kind.
 ///
-/// Prose and commit-message kinds blank out fenced code blocks so the
-/// prose rules skip code. Blanked lines keep the line count, so a
-/// `Violation.line` still names the source line. Exposed so `diff` can
-/// diff in the same prose coordinate system that the engine uses for
-/// `Violation.line`.
+/// Prose and commit-message kinds blank out fenced code blocks and
+/// backtick code spans so the prose rules skip code. Blanked lines
+/// keep the line count and byte layout, so a `Violation.line` still
+/// names the source line. Exposed so `diff` can diff in the same
+/// prose coordinate system that the engine uses for `Violation.line`.
 pub(crate) fn extract_prose_lines(kind: LintKind, text: &str) -> Vec<String> {
     match kind {
         LintKind::ProseFile | LintKind::CommitMessage => {
@@ -144,15 +144,21 @@ pub(crate) fn extract_prose_lines(kind: LintKind, text: &str) -> Vec<String> {
 /// backticks or tildes. A backtick opening fence does not open when
 /// its info string holds a backtick. A closing fence uses the same
 /// character, has at least the opening run length, and holds no text
-/// after the run. Each blanked line keeps its byte length, so rule
-/// line and column offsets stay aligned with the source text.
+/// after the run. Fenced lines hold no inline code span, so only
+/// fence lines are blanked here. Each blanked line keeps its byte
+/// length, so rule line and column offsets stay aligned with the
+/// source text.
 fn blank_out_fenced_code(lines: &[String]) -> Vec<String> {
     let mut out: Vec<String> = Vec::with_capacity(lines.len());
     let mut open: Option<(char, usize)> = None; // (fence char, run length)
     for line in lines {
         let blank = " ".repeat(line.len());
         let Some((ch, run)) = fence_run(line) else {
-            out.push(if open.is_none() { line.clone() } else { blank });
+            out.push(if open.is_none() {
+                blank_out_inline_spans(line)
+            } else {
+                blank
+            });
             continue;
         };
         match open {
@@ -179,11 +185,10 @@ fn blank_out_fenced_code(lines: &[String]) -> Vec<String> {
     out
 }
 
-/// Return the leading backtick or tilde run when the line can open or
-/// close a fence.
+/// The leading backtick or tilde run when the line is a fence line.
 ///
-/// A fence candidate has at most three leading spaces, then three or
-/// more backticks or tildes.
+/// The line has at most three leading spaces, then three or more
+/// backticks or tildes.
 fn fence_run(line: &str) -> Option<(char, usize)> {
     let trimmed = line.trim_start();
     let indent = line.len() - trimmed.len();
@@ -201,6 +206,56 @@ fn fence_run(line: &str) -> Option<(char, usize)> {
     } else {
         None
     }
+}
+
+/// Replace single-line backtick code spans with spaces.
+///
+/// A span starts at a backtick run and ends at the next run of the
+/// same length. An escaped backtick never opens or closes a span.
+/// An open span does not cross a line break, so its backticks stay
+/// literal. Each span keeps its byte length, so rule column offsets
+/// stay aligned with the source line.
+fn blank_out_inline_spans(line: &str) -> String {
+    let bytes = line.as_bytes();
+    let mut out: Vec<u8> = bytes.to_vec();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if bytes[i] != b'`' {
+            i += 1;
+            continue;
+        }
+        let open = i;
+        let mut run = 0usize;
+        while i + run < bytes.len() && bytes[i + run] == b'`' {
+            run += 1;
+        }
+        if bytes[open.saturating_sub(1)] == b'\\' {
+            i += 1;
+            continue;
+        }
+        let mut j = i + run;
+        while j < bytes.len() {
+            if bytes[j] != b'`' {
+                j += 1;
+                continue;
+            }
+            let close = j;
+            let mut close_run = 0usize;
+            while close + close_run < bytes.len() && bytes[close + close_run] == b'`' {
+                close_run += 1;
+            }
+            if close_run == run && bytes[close.saturating_sub(1)] != b'\\' {
+                for k in open..close + close_run {
+                    out[k] = b' ';
+                }
+                i = close + close_run;
+                break;
+            }
+            j = close + close_run;
+        }
+        i += 1;
+    }
+    String::from_utf8(out).unwrap_or_else(|_| line.to_string())
 }
 
 /// Extract `//` and `/* */` comment text from source code.
@@ -527,6 +582,74 @@ mod tests {
         let config = LintConfig::default();
         let text = "Fix the shell loop.\n\n```sh\nfor i in 1 2; do echo $i; done\n```";
         let report = lint(LintKind::CommitMessage, text, &config);
+        assert_eq!(report.summary.total, 0, "{report:?}");
+    }
+
+    #[test]
+    fn lint_inline_code_span_is_exempt() {
+        let config = LintConfig::default();
+        let text = "Use `let x = 1;` now.";
+        let report = lint(LintKind::ProseFile, text, &config);
+        assert_eq!(report.summary.total, 0, "{report:?}");
+    }
+
+    #[test]
+    fn lint_inline_span_keeps_prose_violations() {
+        let config = LintConfig::default();
+        let text = "Use `let x = 1;` now. One; two.";
+        let report = lint(LintKind::ProseFile, text, &config);
+        let semi: Vec<_> = report
+            .violations
+            .iter()
+            .filter(|v| v.rule_id == "semicolon")
+            .collect();
+        assert_eq!(semi.len(), 1, "{report:?}");
+        assert_eq!(semi[0].line, 1, "{report:?}");
+        assert_eq!(semi[0].column, 26, "{report:?}");
+    }
+
+    #[test]
+    fn lint_double_backtick_span_is_exempt() {
+        let config = LintConfig::default();
+        let text = "Run ``a; b`` now.";
+        let report = lint(LintKind::ProseFile, text, &config);
+        assert_eq!(report.summary.total, 0, "{report:?}");
+    }
+
+    #[test]
+    fn lint_open_span_does_not_cross_lines() {
+        let config = LintConfig::default();
+        let text = "Use `let x = 1;\nThen go.";
+        let report = lint(LintKind::ProseFile, text, &config);
+        let semi: Vec<_> = report
+            .violations
+            .iter()
+            .filter(|v| v.rule_id == "semicolon")
+            .collect();
+        assert_eq!(semi.len(), 1, "{report:?}");
+        assert_eq!(semi[0].line, 1, "{report:?}");
+        assert_eq!(semi[0].column, 15, "{report:?}");
+    }
+
+    #[test]
+    fn lint_escaped_backtick_is_not_a_span() {
+        let config = LintConfig::default();
+        let text = "Use \\`x\\`; here.";
+        let report = lint(LintKind::ProseFile, text, &config);
+        let semi: Vec<_> = report
+            .violations
+            .iter()
+            .filter(|v| v.rule_id == "semicolon")
+            .collect();
+        assert_eq!(semi.len(), 1, "{report:?}");
+        assert_eq!(semi[0].column, 10, "{report:?}");
+    }
+
+    #[test]
+    fn lint_span_in_fence_line_is_not_blanked() {
+        let config = LintConfig::default();
+        let text = "```sh\necho `x`; done\n```";
+        let report = lint(LintKind::ProseFile, text, &config);
         assert_eq!(report.summary.total, 0, "{report:?}");
     }
 
