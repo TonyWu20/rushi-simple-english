@@ -122,43 +122,74 @@ pub fn lint(kind: LintKind, text: &str, config: &LintConfig) -> LintReport {
 
 /// Extract prose lines from the source text based on the content kind.
 ///
-/// Prose and commit-message kinds blank out fenced code blocks and
-/// backtick code spans so the prose rules skip code. Blanked lines
-/// keep the line count and byte layout, so a `Violation.line` still
-/// names the source line. Exposed so `diff` can diff in the same
-/// prose coordinate system that the engine uses for `Violation.line`.
+/// Prose and commit-message kinds blank out fenced code blocks, inline
+/// code spans, and markdown table rows so the prose rules skip
+/// non-prose structure. Blanked lines keep the line count and byte
+/// layout, so a `Violation.line` still names the source line. Exposed
+/// so `diff` can diff in the same prose coordinate system that the
+/// engine uses for `Violation.line`.
 pub(crate) fn extract_prose_lines(kind: LintKind, text: &str) -> Vec<String> {
     match kind {
         LintKind::ProseFile | LintKind::CommitMessage => {
             let lines: Vec<String> = text.lines().map(String::from).collect();
-            blank_out_fenced_code(&lines)
+            let lines = blank_out_non_prose(&lines);
+            blank_out_markdown_tables(&lines)
         }
         LintKind::SlashSource => extract_slash_comments(text),
         LintKind::HashSource => extract_hash_comments(text),
     }
 }
 
-/// Blank out the lines of fenced code blocks.
+/// Blank out the lines that hold no prose.
 ///
-/// A fence line has at most three leading spaces, then three or more
-/// backticks or tildes. A backtick opening fence does not open when
-/// its info string holds a backtick. A closing fence uses the same
-/// character, has at least the opening run length, and holds no text
-/// after the run. Fenced lines hold no inline code span, so only
-/// fence lines are blanked here. Each blanked line keeps its byte
-/// length, so rule line and column offsets stay aligned with the
-/// source text.
-fn blank_out_fenced_code(lines: &[String]) -> Vec<String> {
+/// Four kinds of lines are blanked, in order of precedence:
+///
+/// - Fenced code blocks. A fence line has at most three leading
+///   spaces, then three or more backticks or tildes. A backtick
+///   opening fence does not open when its info string holds a
+///   backtick. A closing fence uses the same character, has at
+///   least the opening run length, and holds no text after the run.
+/// - HTML comments. A line that starts with `<!--` opens a comment.
+///   The comment closes on the first line holding `-->`. Comment
+///   lines are blanked in full. A mixed line (prose plus comment) is
+///   kept as prose.
+/// - Indented code blocks. A line with four or more leading spaces
+///   outside a fence is code, not prose.
+///
+/// Everything else is processed for inline backtick code spans. Each
+/// blanked line keeps its byte length, so rule line and column
+/// offsets stay aligned with the source text.
+fn blank_out_non_prose(lines: &[String]) -> Vec<String> {
     let mut out: Vec<String> = Vec::with_capacity(lines.len());
     let mut open: Option<(char, usize)> = None; // (fence char, run length)
+    let mut in_html_comment = false;
     for line in lines {
         let blank = " ".repeat(line.len());
         let Some((ch, run)) = fence_run(line) else {
-            out.push(if open.is_none() {
-                blank_out_inline_spans(line)
+            if open.is_none() {
+                if in_html_comment {
+                    if line.contains("-->") {
+                        in_html_comment = false;
+                    }
+                    out.push(blank);
+                    continue;
+                }
+                if line.trim_start().starts_with("<!--") {
+                    if !line.contains("-->") {
+                        in_html_comment = true;
+                    }
+                    out.push(blank);
+                    continue;
+                }
+                let indent = line.len() - line.trim_start().len();
+                if indent >= 4 {
+                    out.push(blank);
+                    continue;
+                }
+                out.push(blank_out_inline_spans(line));
             } else {
-                blank
-            });
+                out.push(blank);
+            }
             continue;
         };
         match open {
@@ -256,6 +287,65 @@ fn blank_out_inline_spans(line: &str) -> String {
         i += 1;
     }
     String::from_utf8(out).unwrap_or_else(|_| line.to_string())
+}
+
+/// Blank out markdown table lines (header, delimiter, and data rows).
+///
+/// Table rows hold no prose, and a long row of cells can exceed the
+/// sentence-length limit even though every cell is short, so tables are
+/// excluded from prose linting the way fenced code is. A table block is
+/// a header row that contains a pipe, followed immediately by a
+/// delimiter row (only pipes, dashes, colons, and spaces, with at
+/// least one dash), and then any consecutive data rows that contain a
+/// pipe. Each blanked line keeps its byte length, so rule column
+/// offsets stay aligned with the source line.
+fn blank_out_markdown_tables(lines: &[String]) -> Vec<String> {
+    let mut blank = vec![false; lines.len()];
+    let mut i = 0usize;
+    while i < lines.len() {
+        let is_delim = is_table_delimiter_row(&lines[i]);
+        let has_header = i > 0 && is_table_row(&lines[i - 1]);
+        if is_delim && has_header {
+            blank[i - 1] = true;
+            blank[i] = true;
+            i += 1;
+            while i < lines.len() && is_table_row(&lines[i]) && !is_table_delimiter_row(&lines[i]) {
+                blank[i] = true;
+                i += 1;
+            }
+            continue;
+        }
+        i += 1;
+    }
+    lines
+        .iter()
+        .enumerate()
+        .map(|(idx, line)| {
+            if blank[idx] {
+                " ".repeat(line.len())
+            } else {
+                line.clone()
+            }
+        })
+        .collect()
+}
+
+/// A GFM table row: up to three leading spaces, then a pipe anywhere in
+/// the row.
+fn is_table_row(line: &str) -> bool {
+    let trimmed = line.trim_start();
+    let leading = line.len() - trimmed.len();
+    leading <= 3 && trimmed.contains('|')
+}
+
+/// A GFM table delimiter row, like `| --- | :---: |`.
+fn is_table_delimiter_row(line: &str) -> bool {
+    let trimmed = line.trim();
+    !trimmed.is_empty()
+        && trimmed.contains('-')
+        && trimmed
+            .chars()
+            .all(|c| matches!(c, '|' | ':' | '-' | ' '))
 }
 
 /// Extract `//` and `/* */` comment text from source code.
@@ -554,6 +644,111 @@ mod tests {
                 .any(|v| v.rule_id == "semicolon"),
             "{report:?}"
         );
+    }
+
+    #[test]
+    fn lint_markdown_table_is_exempt() {
+        // A GFM table row with many cells must not count as one long
+        // sentence: blanking the table block keeps prose linting clean.
+        let config = LintConfig::default();
+        let table = concat!(
+            "Intro prose.\n",
+            "| Document | Status | Updated | Notes |\n",
+            "|---|---|---|---|\n",
+            "| `a-plan.md` | Implemented | 2026-09-13 | Option A worker plus Option B memo, staged with test gates |\n",
+            "| `b-audit.md` | Audit | 2026-09-13 | Independent perf test for the frame budget, passing |\n",
+            "Outro prose.\n",
+        );
+        let report = lint(LintKind::ProseFile, table, &config);
+        assert!(
+            !report
+                .violations
+                .iter()
+                .any(|v| v.rule_id == "sentence-length"),
+            "{report:?}"
+        );
+        assert!(
+            !report
+                .violations
+                .iter()
+                .any(|v| v.rule_id == "paragraph-length"),
+            "{report:?}"
+        );
+    }
+
+    #[test]
+    fn lint_indented_code_is_exempt() {
+        // An indented code block (four leading spaces) is code, not
+        // prose. Semicolons in it must not fire.
+        let config = LintConfig::default();
+        let text = "Intro.\n    let a = 1; let b = 2; let c = 3; let d = 4;\nOutro.\n";
+        let report = lint(LintKind::ProseFile, text, &config);
+        let semi: Vec<_> = report
+            .violations
+            .iter()
+            .filter(|v| v.rule_id == "semicolon")
+            .collect();
+        assert!(semi.is_empty(), "{semi:?}");
+    }
+
+    #[test]
+    fn lint_html_comment_is_exempt() {
+        // HTML comments are structure, not prose. Long comments must
+        // not trip sentence-length.
+        let config = LintConfig::default();
+        let text = "Intro.\n<!-- This comment is long enough to exceed the sentence length limit when counted as prose words here -->\nOutro.\n";
+        let report = lint(LintKind::ProseFile, text, &config);
+        assert!(
+            !report
+                .violations
+                .iter()
+                .any(|v| v.rule_id == "sentence-length"),
+            "{report:?}"
+        );
+    }
+
+    #[test]
+    fn lint_multi_line_html_comment_is_exempt() {
+        let config = LintConfig::default();
+        let text = "Intro.\n<!--\nmulti line comment with; semicolons inside\n-->\nOutro.\n";
+        let report = lint(LintKind::ProseFile, text, &config);
+        assert!(
+            !report
+                .violations
+                .iter()
+                .any(|v| v.rule_id == "semicolon"),
+            "{report:?}"
+        );
+    }
+
+    #[test]
+    fn lint_table_inside_fence_is_not_blanked() {
+        // Pipe rows inside a fenced code block are code, not a table:
+        // the fence blanking already removed them, so no rule fires.
+        let config = LintConfig::default();
+        let text = "```md\n| a | b c d e f g h i j k l m n o p q r |\n|---|---|\n```\n\nOne; two.\n";
+        let report = lint(LintKind::ProseFile, text, &config);
+        let semi: Vec<_> = report
+            .violations
+            .iter()
+            .filter(|v| v.rule_id == "semicolon")
+            .collect();
+        assert_eq!(semi.len(), 1, "{report:?}");
+    }
+
+    #[test]
+    fn lint_prose_line_with_single_pipe_is_not_blanked() {
+        // A prose line that merely contains a pipe (no delimiter row)
+        // stays prose: semicolons in it are still reported.
+        let config = LintConfig::default();
+        let text = "The value a|b here; one more.\nShort tail.\n";
+        let report = lint(LintKind::ProseFile, text, &config);
+        let semi: Vec<_> = report
+            .violations
+            .iter()
+            .filter(|v| v.rule_id == "semicolon")
+            .collect();
+        assert_eq!(semi.len(), 1, "{report:?}");
     }
 
     #[test]

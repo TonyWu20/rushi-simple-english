@@ -68,7 +68,7 @@ dependencies = [
 
 [[package]]
 name = "hook-simple-english"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "fnv",
  "regex",
@@ -76,7 +76,6 @@ dependencies = [
  "serde_json",
  "shlex",
  "similar",
- "split-paragraphs",
  "tempfile",
 ]
 
@@ -233,12 +232,6 @@ checksum = "4f66ca1f7aca2474dc10c942eb22feffc897735f54cd1db90138c2fddb490987"
 dependencies = [
  "bstr",
 ]
-
-[[package]]
-name = "split-paragraphs"
-version = "1.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8ae1b230ef58367849aaf845601a1a20c5d45ad68d983d9db5b02e239d17a41c"
 
 [[package]]
 name = "syn"

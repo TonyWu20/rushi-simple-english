@@ -13,7 +13,7 @@
 
 [package]
 name = "hook-simple-english"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 description = "ASD-STE100 writing-rule hook for the rushi harness. Lints prose, diffs, and commit messages, and blocks hard violations on the tool.before and model.before hook windows."
 license = "MIT"
@@ -33,7 +33,6 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1.0"
 regex = "1"
 similar = "3.2.0"
-split-paragraphs = "1.0.0"
 fnv = "1.0.7"
 shlex = "2.0.1"
 

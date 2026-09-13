@@ -1,12 +1,11 @@
-//! Sentence and paragraph segmentation for the simple-english lint engine.
+//! Sentence and paragraph segmentation for the simple-english lint
+//! engine.
 //!
 //! Simplified from the TypeScript original. Splits text into sentences
 //! (delimited by `.`, `!`, `?` plus closing delimiters) and groups them
-//! into paragraphs (separated by blank lines, via the `split-paragraphs`
-//! crate which also handles CRLF/CR line endings).
-//! Handles a small set of known abbreviations to avoid spurious splits.
-
-use split_paragraphs::SplitParagraphs;
+//! into paragraphs. Paragraphs break at blank lines and at markdown
+//! block boundaries (headings, list items, thematic breaks). Handles a
+//! small set of known abbreviations to avoid spurious splits.
 
 use crate::types::{Paragraph, Sentence};
 
@@ -50,34 +49,72 @@ pub fn segment_sentences(text: &str) -> Vec<Sentence> {
 
     for (i, line) in lines.iter().enumerate() {
         if line.trim().is_empty() {
-            close_sentence(&mut sentences, &mut parts, 0, 0);
+            if let Some((l, c)) = open {
+                close_sentence(&mut sentences, &mut parts, l, c);
+            }
             open = None;
             continue;
         }
 
-        let trimmed = line.trim_start();
-        let leading_ws = line.len() - trimmed.len();
+        let (kind, content_start) = block_analysis(line);
+
+        // A thematic break or setext underline carries no prose. Treat
+        // it like a blank line: close the open sentence and start
+        // fresh.
+        if kind == BlockKind::ThematicBreak {
+            if let Some((l, c)) = open {
+                close_sentence(&mut sentences, &mut parts, l, c);
+            }
+            open = None;
+            continue;
+        }
+
+        // A new block must not accumulate into the open sentence. Close
+        // the open sentence first so this line starts its own sentence.
+        // Without this, consecutive no-period list items merge into one
+        // long pseudo-sentence.
+        if kind != BlockKind::None && !parts.is_empty() {
+            let (sl, sc) = open.unwrap_or((i, 0));
+            close_sentence(&mut sentences, &mut parts, sl, sc);
+            open = None;
+        }
+
+        // Strip the block marker (`#`, `- `, `1. `) so it does not
+        // count as a word and its `.` does not act as a terminator.
+        let content = &line[content_start..];
+        let marker_len = content_start;
+
+        let trimmed = content.trim_start();
+        let leading_ws = marker_len + (content.len() - trimmed.len());
         if open.is_none() {
             open = Some((i, leading_ws));
         }
 
         let mut last_end = 0usize;
-        for (_start, end) in sentence_ends(line) {
-            let part = &line[last_end..end];
+        for (_start, end) in sentence_ends(content) {
+            let part = &content[last_end..end];
             if !part.trim().is_empty() {
                 parts.push(part.trim().to_string());
             }
             let start_line = open.map(|(l, _)| l).unwrap_or(i);
-            let start_col = open.map(|(_, c)| c).unwrap_or(last_end);
+            let start_col = open.map(|(_, c)| c).unwrap_or(marker_len + last_end);
             close_sentence(&mut sentences, &mut parts, start_line, start_col);
             open = None;
             last_end = end;
         }
 
-        let rest = &line[last_end..];
+        let rest = &content[last_end..];
         if !rest.trim().is_empty() {
-            open = Some((i, last_end + (rest.len() - rest.trim_start().len())));
+            open = Some((i, marker_len + last_end + (rest.len() - rest.trim_start().len())));
             parts.push(rest.trim().to_string());
+        }
+
+        // A single-line block (a heading) must not continue onto the
+        // next line. Close its sentence at end of line.
+        if kind == BlockKind::SingleLine && !parts.is_empty() {
+            let (sl, sc) = open.unwrap_or((i, 0));
+            close_sentence(&mut sentences, &mut parts, sl, sc);
+            open = None;
         }
     }
 
@@ -147,75 +184,178 @@ fn sentence_ends(line: &str) -> Vec<(usize, usize)> {
 
 /// Group sentences into paragraphs.
 ///
-/// Paragraph boundaries are detected by the `split-paragraphs` crate,
-/// which splits on blank (or whitespace-only) lines and supports both
-/// `\n` and `\r\n` line endings.
+/// A paragraph begins on the first line, after any blank line, or on a
+/// line that starts a markdown block (a heading, a list item, or a
+/// thematic break). Consecutive non-boundary lines inside one block
+/// form a single paragraph, so a wrapped paragraph stays whole while a
+/// bulleted or numbered list becomes one paragraph per item.
 ///
 /// Each returned `Paragraph` carries the 1-based line number of its
-/// first line and the subset of `sentences` that start on lines within
-/// the paragraph.
+/// first non-blank line and the subset of `sentences` that start on
+/// lines belonging to that paragraph.
 pub fn segment_paragraphs(
     text: &str,
     sentences: &[Sentence],
 ) -> Vec<Paragraph> {
-    let para_texts: Vec<&str> = text.paragraphs().collect();
-    if para_texts.is_empty() {
+    let lines: Vec<&str> = text.split('\n').collect();
+    if lines.is_empty() {
         return Vec::new();
     }
 
-    // Pre-compute byte offsets where each 0-based line starts, so we can
-    // map a paragraph's byte offset to a 1-based line number in O(log n).
-    let line_starts: Vec<usize> = {
-        let mut offsets = vec![0usize];
-        for (i, c) in text.char_indices() {
-            if c == '\n' {
-                offsets.push(i + 1);
+    // Assign each line to a paragraph index. A new paragraph starts at
+    // line zero, after any blank line, or at a markdown block boundary.
+    let mut para_of_line: Vec<usize> = Vec::with_capacity(lines.len());
+    let mut current = 0usize;
+    let mut prev_blank = true;
+    for (i, line) in lines.iter().enumerate() {
+        let blank = line.trim().is_empty();
+        let new_block = !blank && block_analysis(line).0 != BlockKind::None;
+        if i > 0 && (prev_blank || new_block) {
+            current += 1;
+        }
+        para_of_line.push(current);
+        prev_blank = blank;
+    }
+
+    let para_count = current + 1;
+
+    // The 1-based first non-blank line number of each paragraph.
+    let mut para_first_line = vec![0usize; para_count];
+    for (i, line) in lines.iter().enumerate() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let p = para_of_line[i];
+        if para_first_line[p] == 0 {
+            para_first_line[p] = i + 1;
+        }
+    }
+
+    // Group sentences by the paragraph that owns their start line. A
+    // sentence starts on the line holding its first non-blank
+    // character.
+    let mut groups: Vec<Vec<Sentence>> = vec![Vec::new(); para_count];
+    for s in sentences {
+        let start = s.line.saturating_sub(1);
+        if start < lines.len() && !lines[start].trim().is_empty() {
+            let p = para_of_line[start];
+            groups[p].push(s.clone());
+        }
+    }
+
+    groups
+        .into_iter()
+        .enumerate()
+        .filter(|(_, g)| !g.is_empty())
+        .map(|(p, group)| Paragraph {
+            sentences: group,
+            line: para_first_line[p],
+            column: 1,
+        })
+        .collect()
+}
+
+/// The kind of markdown block a line starts, and where the block's
+/// prose content begins (a byte offset into the line).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BlockKind {
+    /// A regular prose line: a wrapped continuation of the previous
+    /// block, or plain text.
+    None,
+    /// A single-line block (an ATX heading). Its sentence must close
+    /// at end of line.
+    SingleLine,
+    /// A list item. Its content may continue on the next indented
+    /// line, but the line starts a new block.
+    Item,
+    /// A thematic break or setext heading underline. It carries no
+    /// prose and acts as a separator.
+    ThematicBreak,
+}
+
+/// Classify the markdown block that `line` starts.
+///
+/// Returns the block kind and the byte offset where the block's prose
+/// content begins (past any leading marker such as `#`, `- `, or
+/// `1.`). At most three leading spaces are allowed, matching CommonMark
+/// block indentation. These are structural boundaries, so an open
+/// sentence and an open paragraph must close before such a line.
+fn block_analysis(line: &str) -> (BlockKind, usize) {
+    let t = line.trim_start();
+    let indent = line.len() - t.len();
+    if indent > 3 || t.is_empty() {
+        return (BlockKind::None, 0);
+    }
+
+    // Thematic break or setext heading underline: three or more of the
+    // same `-`, `_`, `*`, or `=`, with optional spaces between.
+    let solid: Vec<char> = t.chars().filter(|c| !c.is_whitespace()).collect();
+    if solid.len() >= 3
+        && solid
+            .iter()
+            .all(|c| matches!(c, '-' | '_' | '*' | '='))
+        && solid.iter().all(|c| c == &solid[0])
+    {
+        return (BlockKind::ThematicBreak, 0);
+    }
+
+    // Blockquote prefix: one or more `>`, then an optional space or
+    // tab. A quote line continues the blockquote block rather than
+    // starting a new one, so it is not a block boundary. The prefix is
+    // stripped so it does not count as a word.
+    if t.starts_with('>') {
+        let quotes = t.chars().take_while(|&c| c == '>').count();
+        let after = &t[quotes..];
+        let space = after.starts_with(' ') || after.starts_with('\t');
+        let skip = quotes + usize::from(space);
+        return (BlockKind::None, indent + skip);
+    }
+
+    // ATX heading: one to six `#`, then a space, a tab, or end of
+    // line.
+    if t.starts_with('#') {
+        let hashes = t.chars().take_while(|&c| c == '#').count();
+        if (1..=6).contains(&hashes) {
+            let after = &t[hashes..];
+            let space = after.starts_with(' ') || after.starts_with('\t');
+            if after.is_empty() || space {
+                let skip = hashes + usize::from(space);
+                return (BlockKind::SingleLine, indent + skip);
             }
         }
-        offsets
-    };
-
-    /// Returns the 1-based line number that contains byte offset `pos`.
-    fn line_at(line_starts: &[usize], pos: usize) -> usize {
-        match line_starts.binary_search(&pos) {
-            Ok(i) => i + 1, // exact match: 0-based line i → 1-based i+1
-            Err(i) => i,     // insertion point: pos is in 0-based line i-1 → 1-based i
-        }
+        return (BlockKind::None, 0);
     }
 
-    let mut search_from = 0usize;
-    let mut result: Vec<Paragraph> = Vec::with_capacity(para_texts.len());
+    let first = t.chars().next().unwrap_or_default();
 
-    for para_text in &para_texts {
-        // Locate this paragraph's start in the original text. Paragraphs
-        // are in order and non-overlapping, so we advance `search_from`
-        // past each one to avoid matching an earlier duplicate.
-        let pos = text[search_from..]
-            .find(para_text)
-            .map(|off| off + search_from)
-            .unwrap_or(search_from);
-        search_from = pos + para_text.len();
-
-        let start_line = line_at(&line_starts, pos);
-        let para_line_count = para_text.lines().count().max(1);
-        let end_line = start_line + para_line_count - 1;
-
-        let para_sents: Vec<Sentence> = sentences
-            .iter()
-            .filter(|s| s.line >= start_line && s.line <= end_line)
-            .cloned()
-            .collect();
-
-        if !para_sents.is_empty() {
-            result.push(Paragraph {
-                sentences: para_sents,
-                line: start_line,
-                column: 1,
-            });
+    // Bullet list item: `-`, `*`, or `+` followed by a space or tab.
+    if matches!(first, '-' | '*' | '+') {
+        let second = t.chars().nth(1);
+        if matches!(second, Some(' ') | Some('\t')) {
+            return (BlockKind::Item, indent + 2);
         }
+        return (BlockKind::None, 0);
     }
 
-    result
+    // Numbered list item: one to nine digits, then `.` or `)`, then a
+    // space, a tab, or end of line.
+    if first.is_ascii_digit() {
+        let digits = t.chars().take_while(|c| c.is_ascii_digit()).count();
+        if (1..=9).contains(&digits) {
+            let marker = t.as_bytes()[digits];
+            if marker == b'.' || marker == b')' {
+                let follow = &t[digits + 1..];
+                let space = follow.starts_with(' ') || follow.starts_with('\t');
+                if follow.is_empty() || space {
+                    let skip = digits + 1 + usize::from(space);
+                    return (BlockKind::Item, indent + skip);
+                }
+            }
+        }
+        return (BlockKind::None, 0);
+    }
+
+    (BlockKind::None, 0)
 }
 
 #[cfg(test)]
@@ -305,12 +445,24 @@ mod tests {
         // Two sentences: the first ends at the '.' after the ellipsis,
         // the second is the tail. Before the byte-index fix this panicked
         // because the char index was sliced as a byte index mid-'…'.
+        // The list marker `- ` is stripped from the sentence text.
         assert_eq!(sents.len(), 2);
         assert_eq!(
             sents[0].text,
-            "- **`table_grid`** (rewritten) \u{2014} wide cells wrap, truncated with `\u{2026}`."
+            "**`table_grid`** (rewritten) \u{2014} wide cells wrap, truncated with `\u{2026}`."
         );
         assert_eq!(sents[1].text, "A data row spans.");
+    }
+
+    #[test]
+    fn blockquote_prefix_is_stripped_from_sentence_text() {
+        // A quoted line: the `>` prefix is stripped so it does not
+        // count as a word. Consecutive quote lines accumulate into
+        // one sentence (same as a wrapped paragraph).
+        let text = "> quoted first line\n> second quoted line.\n";
+        let sents = segment_sentences(text);
+        assert_eq!(sents.len(), 1);
+        assert_eq!(sents[0].text, "quoted first line second quoted line.");
     }
 
     #[test]
@@ -319,5 +471,63 @@ mod tests {
         assert_eq!(sents.len(), 2);
         assert_eq!(sents[0].text, "你好世界。");
         assert_eq!(sents[1].text, "这是测试！");
+    }
+
+    #[test]
+    fn consecutive_bullets_do_not_merge_into_one_sentence() {
+        // Regression: no-period bullet lines must not accumulate into one
+        // long pseudo-sentence across list items.
+        let text = "- First item with no period\n- Second item with no period\n- Third item with no period\n";
+        let sents = segment_sentences(text);
+        // Each bullet is its own sentence (3), not one merged 21-word sentence.
+        assert_eq!(sents.len(), 3);
+        for s in &sents {
+            assert!(s.word_count <= 6, "sentence grew too large: {} ({})", s.text, s.word_count);
+        }
+    }
+
+    #[test]
+    fn numbered_list_items_are_separate_paragraphs() {
+        // Regression: consecutive numbered list items are separate blocks,
+        // so a long numbered list must not read as one giant paragraph.
+        let text = "1. First item passes.\n2. Second item passes.\n3. Third item passes.\n4. Fourth item passes.\n5. Fifth item passes.\n6. Sixth item passes.\n7. Seventh item passes.\n";
+        let sents = segment_sentences(text);
+        let paras = segment_paragraphs(text, &sents);
+        assert!(paras.len() >= 7, "each list item should be its own paragraph, got {}", paras.len());
+        assert!(paras
+            .iter()
+            .all(|p| p.sentences.len() <= 6), "no list paragraph exceeds the limit");
+    }
+
+    #[test]
+    fn list_items_are_separate_paragraphs() {
+        // Regression: consecutive bullets are separate blocks, so a 7-item
+        // list must not read as one 7-sentence paragraph.
+        let text = "- One.\n- Two.\n- Three.\n- Four.\n- Five.\n- Six.\n- Seven.\n";
+        let sents = segment_sentences(text);
+        let paras = segment_paragraphs(text, &sents);
+        assert_eq!(paras.len(), 7);
+        assert!(paras
+            .iter()
+            .all(|p| p.sentences.len() <= 6), "no list paragraph exceeds the limit");
+    }
+
+    #[test]
+    fn heading_is_its_own_block_boundary() {
+        // A heading after prose starts a fresh sentence, not a merge.
+        // The `##` marker is stripped from the sentence text, and the
+        // heading must not merge with the body line that follows it.
+        let text = "Intro text.\n## Section heading with many trailing words here\nBody line after the heading follows here.\n";
+        let sents = segment_sentences(text);
+        assert_eq!(sents[0].text, "Intro text.");
+        assert_eq!(sents.len(), 3);
+        let heading = sents
+            .iter()
+            .find(|s| s.text.starts_with("Section heading"))
+            .expect("heading sentence missing");
+        // The marker is stripped and the heading must not merge with
+        // the body line that follows it.
+        assert!(!heading.text.contains("Body line"));
+        assert_eq!(sents[2].text, "Body line after the heading follows here.");
     }
 }
