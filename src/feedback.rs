@@ -153,7 +153,7 @@ fn summary_for_rule(id: &str, max_words: usize) -> String {
         "dictionary-not-approved-word" => "Use approved words from the STE dictionary.".to_string(),
         "paragraph-length" => "Use no more than six sentences in one paragraph.".to_string(),
         "phrasal-verb" => "Use an approved single-word verb instead of a phrasal verb.".to_string(),
-        "semicolon" => "Do not use semicolons. Write two sentences.".to_string(),
+        "semicolon" => "Do not use semicolons in prose. Write two sentences. Code fences are exempt.".to_string(),
         "sentence-length" => format!("Keep each sentence to {} words or fewer.", max_words),
         "verb-progressive" => "Do not use progressive verb forms.".to_string(),
         "verb-passive" => "Prefer active voice.".to_string(),

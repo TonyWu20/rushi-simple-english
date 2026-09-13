@@ -285,4 +285,22 @@ mod tests {
         let report = lint_write(LintKind::ProseFile, "bad; text", None, &config);
         assert!(report.summary.hard >= 1);
     }
+
+    #[test]
+    fn lint_write_new_file_fenced_code_is_exempt() {
+        let config = LintConfig::default();
+        let new = "Title.\n\n```sh\nrun a; run b\n```\n";
+        let report = lint_write(LintKind::ProseFile, new, None, &config);
+        assert_eq!(report.summary.total, 0, "{report:?}");
+    }
+
+    #[test]
+    fn lint_edit_inside_fence_is_exempt() {
+        let config = LintConfig::default();
+        let file = "Title.\n\n```sh\nrun a\n```\n";
+        let report =
+            lint_edit(LintKind::ProseFile, file, "run a", "run a; run b", false, &config)
+                .unwrap();
+        assert_eq!(report.summary.total, 0, "{report:?}");
+    }
 }

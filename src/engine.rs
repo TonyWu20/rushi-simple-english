@@ -122,15 +122,84 @@ pub fn lint(kind: LintKind, text: &str, config: &LintConfig) -> LintReport {
 
 /// Extract prose lines from the source text based on the content kind.
 ///
-/// Exposed so `diff` can diff in the same prose coordinate system that
-/// the engine uses for `Violation.line`.
+/// Prose and commit-message kinds blank out fenced code blocks so the
+/// prose rules skip code. Blanked lines keep the line count, so a
+/// `Violation.line` still names the source line. Exposed so `diff` can
+/// diff in the same prose coordinate system that the engine uses for
+/// `Violation.line`.
 pub(crate) fn extract_prose_lines(kind: LintKind, text: &str) -> Vec<String> {
     match kind {
         LintKind::ProseFile | LintKind::CommitMessage => {
-            text.lines().map(String::from).collect()
+            let lines: Vec<String> = text.lines().map(String::from).collect();
+            blank_out_fenced_code(&lines)
         }
         LintKind::SlashSource => extract_slash_comments(text),
         LintKind::HashSource => extract_hash_comments(text),
+    }
+}
+
+/// Blank out the lines of fenced code blocks.
+///
+/// A fence line has at most three leading spaces, then three or more
+/// backticks or tildes. A backtick opening fence does not open when
+/// its info string holds a backtick. A closing fence uses the same
+/// character, has at least the opening run length, and holds no text
+/// after the run. Each blanked line keeps its byte length, so rule
+/// line and column offsets stay aligned with the source text.
+fn blank_out_fenced_code(lines: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::with_capacity(lines.len());
+    let mut open: Option<(char, usize)> = None; // (fence char, run length)
+    for line in lines {
+        let blank = " ".repeat(line.len());
+        let Some((ch, run)) = fence_run(line) else {
+            out.push(if open.is_none() { line.clone() } else { blank });
+            continue;
+        };
+        match open {
+            None => {
+                let rest = &line.trim_start()[run..];
+                if ch == '`' && rest.contains('`') {
+                    // Not a fence: a backtick in the info string.
+                    out.push(line.clone());
+                } else {
+                    open = Some((ch, run));
+                    out.push(blank);
+                }
+            }
+            Some((och, on)) => {
+                let rest = &line.trim_start()[run..];
+                let closes = ch == och && run >= on && rest.trim().is_empty();
+                if closes {
+                    open = None;
+                }
+                out.push(blank);
+            }
+        }
+    }
+    out
+}
+
+/// Return the leading backtick or tilde run when the line can open or
+/// close a fence.
+///
+/// A fence candidate has at most three leading spaces, then three or
+/// more backticks or tildes.
+fn fence_run(line: &str) -> Option<(char, usize)> {
+    let trimmed = line.trim_start();
+    let indent = line.len() - trimmed.len();
+    if indent > 3 {
+        return None;
+    }
+    let mut chars = trimmed.chars();
+    let ch = chars.next()?;
+    if ch != '`' && ch != '~' {
+        return None;
+    }
+    let run = 1 + chars.take_while(|&c| c == ch).count();
+    if run >= 3 {
+        Some((ch, run))
+    } else {
+        None
     }
 }
 
@@ -378,6 +447,87 @@ mod tests {
             .violations
             .iter()
             .any(|v| v.rule_id == "semicolon"));
+    }
+
+    #[test]
+    fn lint_fenced_code_is_exempt() {
+        let config = LintConfig::default();
+        let text = "Good prose here.\n```rust\nlet a = 1; // one\nlet b = a; // two\n```\nMore prose after the fence.";
+        let report = lint(LintKind::ProseFile, text, &config);
+        assert_eq!(report.summary.total, 0, "{report:?}");
+    }
+
+    #[test]
+    fn lint_semicolon_outside_fence_is_reported_with_source_line() {
+        let config = LintConfig::default();
+        let text = "```sh\necho hi; echo bye\n```\nOne; two.";
+        let report = lint(LintKind::ProseFile, text, &config);
+        let semi: Vec<_> = report
+            .violations
+            .iter()
+            .filter(|v| v.rule_id == "semicolon")
+            .collect();
+        assert_eq!(semi.len(), 1, "{report:?}");
+        assert_eq!(semi[0].line, 4, "{report:?}");
+    }
+
+    #[test]
+    fn lint_tilde_fence_is_exempt() {
+        let config = LintConfig::default();
+        let text = "Intro.\n~~~\nx = 1;\n~~~\nOutro.";
+        let report = lint(LintKind::ProseFile, text, &config);
+        assert_eq!(report.summary.total, 0, "{report:?}");
+    }
+
+    #[test]
+    fn lint_longer_close_fence_is_needed() {
+        let config = LintConfig::default();
+        let text = "````\n```\na = 1;\n````\nTail.";
+        let report = lint(LintKind::ProseFile, text, &config);
+        assert_eq!(report.summary.total, 0, "{report:?}");
+    }
+
+    #[test]
+    fn lint_unclosed_fence_blanks_to_end() {
+        let config = LintConfig::default();
+        let text = "Intro.\n```python\nx = 1;\ny = 2;\n";
+        let report = lint(LintKind::ProseFile, text, &config);
+        assert!(
+            !report
+                .violations
+                .iter()
+                .any(|v| v.rule_id == "semicolon"),
+            "{report:?}"
+        );
+    }
+
+    #[test]
+    fn lint_indented_fence_is_exempt() {
+        let config = LintConfig::default();
+        let text = "Intro.\n   ```\nx = 1;\n   ```\n";
+        let report = lint(LintKind::ProseFile, text, &config);
+        assert_eq!(report.summary.total, 0, "{report:?}");
+    }
+
+    #[test]
+    fn lint_backtick_in_info_string_is_not_a_fence() {
+        let config = LintConfig::default();
+        let text = "```a`b\ncode; here\n";
+        let report = lint(LintKind::ProseFile, text, &config);
+        let semi: Vec<_> = report
+            .violations
+            .iter()
+            .filter(|v| v.rule_id == "semicolon")
+            .collect();
+        assert_eq!(semi.len(), 1, "the line is prose, not a fence: {report:?}");
+    }
+
+    #[test]
+    fn lint_commit_message_fence_is_exempt() {
+        let config = LintConfig::default();
+        let text = "Fix the shell loop.\n\n```sh\nfor i in 1 2; do echo $i; done\n```";
+        let report = lint(LintKind::CommitMessage, text, &config);
+        assert_eq!(report.summary.total, 0, "{report:?}");
     }
 
     #[test]

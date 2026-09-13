@@ -101,7 +101,7 @@ pub fn check_semicolons(lines: &[String], severity: Severity) -> Vec<Violation> 
             out.push(Violation {
                 rule_id: "semicolon",
                 severity,
-                message: "Do not use a semicolon. Write two sentences.".into(),
+                message: "Do not use a semicolon in prose. Write two sentences.".into(),
                 suggestions: None,
                 line: i + 1,
                 column: m.start() + 1,

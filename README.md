@@ -19,7 +19,7 @@ prose, file edits, and git commit messages.
 | Rule ID                         | Default  | Checks                          |
 |---------------------------------|----------|---------------------------------|
 | `contraction`                   | hard     | `'re`, `'ve`, `'ll`, `'d`, `'m`, `'s` contractions |
-| `semicolon`                     | hard     | Any `;` in prose                 |
+| `semicolon`                     | hard     | Any `;` in prose (fenced code is skipped) |
 | `sentence-length`               | hard     | Sentences over 25 words         |
 | `paragraph-length`              | hard     | Paragraphs over 6 sentences     |
 | `phrasal-verb`                  | hard     | "carry out", "spin up", etc.    |
@@ -30,6 +30,13 @@ prose, file edits, and git commit messages.
 | `verb-perfect`                  | hard     | *(skipped — needs POS tagger)*   |
 | `hedging`                       | soft     | "it is important to note", etc. |
 | `marketing`                     | soft     | "seamless", "robust", etc.      |
+
+## Code fences
+
+Prose and commit-message text skips fenced code blocks. A fence line
+starts with three or more backticks or tildes, with at most three
+leading spaces. Lines inside the fence are not linted. This keeps
+rules such as `semicolon` from tripping on code.
 
 ## Config
 
