@@ -1,8 +1,10 @@
 //! Core lint orchestration.
 //!
-//! `lint()` extracts prose from the source text based on the content
-//! kind, segments it into sentences and paragraphs, runs all enabled
-//! rules, and collects violations into a `LintReport`.
+//! `lint()` extracts prose from the source text based on the kind.
+//! It segments sentences and paragraphs. It runs the enabled rules
+//! that apply to the kind. It collects violations into a report.
+//! The semicolon rule runs only for the prose kinds. It skips source
+//! kinds because a semicolon there is code punctuation.
 
 use crate::rules;
 use crate::sentences::{segment_paragraphs, segment_sentences};
@@ -62,9 +64,13 @@ pub fn lint(kind: LintKind, text: &str, config: &LintConfig) -> LintReport {
         violations.extend(rules::check_contractions(&prose_lines, sev));
     }
 
-    // Semicolon
-    if let Some(sev) = config.resolve_rule("semicolon") {
-        violations.extend(rules::check_semicolons(&prose_lines, sev));
+    // Semicolon. Runs for the prose kinds only. In source files a
+    // semicolon is code punctuation, so it stays out of reports even
+    // when it sits inside a comment.
+    if matches!(kind, LintKind::ProseFile | LintKind::CommitMessage) {
+        if let Some(sev) = config.resolve_rule("semicolon") {
+            violations.extend(rules::check_semicolons(&prose_lines, sev));
+        }
     }
 
     // Phrasal verbs
@@ -349,6 +355,9 @@ fn is_table_delimiter_row(line: &str) -> bool {
 }
 
 /// Extract `//` and `/* */` comment text from source code.
+///
+/// A `//` inside a string literal does not open a comment. The scan
+/// tracks string state, so `http://x` in a string stays code.
 fn extract_slash_comments(text: &str) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     let mut in_block = false;
@@ -366,7 +375,7 @@ fn extract_slash_comments(text: &str) -> Vec<String> {
             }
             continue;
         }
-        if let Some(pos) = trimmed.find("//") {
+        if let Some(pos) = find_comment_start(trimmed) {
             let comment = &trimmed[pos + 2..].trim();
             if !comment.is_empty() {
                 out.push(comment.to_string());
@@ -394,6 +403,41 @@ fn extract_slash_comments(text: &str) -> Vec<String> {
         }
     }
     out
+}
+
+/// Find the `//` comment start on a source line.
+///
+/// A `//` inside a string literal is not a comment. The scan tracks
+/// string state, so `http://x` in a string does not open a comment.
+/// Char literals hold one char only. They cannot hold two slashes.
+/// They need no tracking.
+fn find_comment_start(line: &str) -> Option<usize> {
+    let bytes = line.as_bytes();
+    let mut in_string = false;
+    let mut i = 0usize;
+    while i + 1 < bytes.len() {
+        let c = bytes[i];
+        if in_string {
+            match c {
+                b'\\' => i += 2,
+                b'"' => {
+                    i += 1;
+                    in_string = false;
+                }
+                _ => i += 1,
+            }
+            continue;
+        }
+        match c {
+            b'"' => {
+                in_string = true;
+                i += 1;
+            }
+            b'/' if bytes[i + 1] == b'/' => return Some(i),
+            _ => i += 1,
+        }
+    }
+    None
 }
 
 /// Extract `#` comment lines from source code.
@@ -592,6 +636,73 @@ mod tests {
             .violations
             .iter()
             .any(|v| v.rule_id == "semicolon"));
+    }
+
+    #[test]
+    fn lint_semicolon_is_skipped_for_slash_source() {
+        // A semicolon in Rust code or in a Rust comment must not
+        // fire. The agent writes Rust with `;` all the time.
+        let config = LintConfig::default();
+        let text = "fn main() {\n    let a = 1; // one; two\n}\n";
+        let report = lint(LintKind::SlashSource, text, &config);
+        assert!(
+            !report.violations.iter().any(|v| v.rule_id == "semicolon"),
+            "{report:?}"
+        );
+    }
+
+    #[test]
+    fn lint_semicolon_is_skipped_for_hash_source() {
+        // A semicolon in a `#` comment must not fire either.
+        let config = LintConfig::default();
+        let text = "x = 1\n# one; two\n";
+        let report = lint(LintKind::HashSource, text, &config);
+        assert!(
+            !report.violations.iter().any(|v| v.rule_id == "semicolon"),
+            "{report:?}"
+        );
+    }
+
+    #[test]
+    fn lint_slash_url_string_is_exempt() {
+        // A URL in a string literal is code. The `//` in it must not
+        // open a comment. No prose comes out of this line at all.
+        let config = LintConfig::default();
+        let text = "fn f() {\n    let u = \"http://x.example/a\";\n}\n";
+        let report = lint(LintKind::SlashSource, text, &config);
+        assert_eq!(report.summary.total, 0, "{report:?}");
+    }
+
+    #[test]
+    fn lint_slash_comment_after_string_is_prose() {
+        // A `//` after the closing quote still opens a comment.
+        // An escaped quote in the string must not break the scan.
+        let config = LintConfig::default();
+        let text = "fn f() {\n    let s = \"a\\\"b\"; // kick off\n}\n";
+        let report = lint(LintKind::SlashSource, text, &config);
+        assert!(
+            report
+                .violations
+                .iter()
+                .any(|v| v.rule_id == "phrasal-verb"),
+            "{report:?}"
+        );
+    }
+
+    #[test]
+    fn slash_source_prose_rules_still_apply() {
+        // The skip is semicolon-only. Other prose rules still run on
+        // source comments, so a phrasal verb in one still fires.
+        let config = LintConfig::default();
+        let text = "fn main() {\n    // kick off the build\n}\n";
+        let report = lint(LintKind::SlashSource, text, &config);
+        assert!(
+            report
+                .violations
+                .iter()
+                .any(|v| v.rule_id == "phrasal-verb"),
+            "{report:?}"
+        );
     }
 
     #[test]

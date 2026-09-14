@@ -93,6 +93,9 @@ pub fn check_contractions(lines: &[String], severity: Severity) -> Vec<Violation
 
 // ── Semicolon ──────────────────────────────────────────────────────────────
 
+/// Check a prose line for semicolons. The engine runs this for the
+/// prose kinds only; source files skip it because a semicolon there
+/// is code punctuation.
 pub fn check_semicolons(lines: &[String], severity: Severity) -> Vec<Violation> {
     let re = Regex::new(r";").unwrap();
     let mut out = Vec::new();

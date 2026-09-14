@@ -167,9 +167,9 @@ mod tests {
 
     #[test]
     fn slash_source_preexisting_violation_does_not_resurface() {
-        // A `.rs` file (SlashSource): the file-line numbers of the
-        // comments differ from the prose-line indices the engine reports.
-        // The semicolon is on a comment that the edit does not touch, so
+        // A `.rs` file (SlashSource): the semicolon rule no longer runs
+        // for source kinds, and even the old coordinate bug is covered:
+        // the semicolon sits on a comment the edit does not touch, so
         // it must not resurface even though the edited file line number
         // happens to match that prose index.
         let config = LintConfig::default();
@@ -191,14 +191,16 @@ mod tests {
 
     #[test]
     fn slash_source_new_violation_is_reported() {
-        // A new comment introduces a semicolon on a changed prose line.
+        // A new comment introduces a phrasal verb on a changed prose
+        // line. The semicolon in the same comment no longer fires: the
+        // semicolon rule runs for the prose kinds only.
         let config = LintConfig::default();
         let old = "fn main() {\n    let a = 1;\n}\n";
         let report = lint_edit(
             LintKind::SlashSource,
             old,
             "let a = 1;",
-            "let a = 1; // bad; note",
+            "let a = 1; // kick off the build; note",
             false,
             &config,
         )
@@ -207,8 +209,15 @@ mod tests {
             report
                 .violations
                 .iter()
+                .any(|v| v.rule_id == "phrasal-verb"),
+            "new phrasal verb on a changed prose line was dropped: {report:?}"
+        );
+        assert!(
+            !report
+                .violations
+                .iter()
                 .any(|v| v.rule_id == "semicolon"),
-            "new semicolon on a changed prose line was dropped: {report:?}"
+            "semicolon in a source comment must not fire: {report:?}"
         );
     }
 
