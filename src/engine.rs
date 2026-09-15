@@ -9,8 +9,6 @@
 use crate::rules;
 use crate::sentences::{segment_paragraphs, segment_sentences};
 use crate::types::{LintConfig, LintKind, Severity, Violation};
-
-// Re-export key types for external consumers.
 pub use crate::types::{LintReport, LintSummary};
 
 /// The default maximum words per sentence.
@@ -42,8 +40,12 @@ pub fn lint(kind: LintKind, text: &str, config: &LintConfig) -> LintReport {
     }
 
     // 2. Segment sentences and paragraphs.
+    // Source kinds keep each extracted comment line its own sentence.
+    // Merging would let a run of period-free comment lines grow into
+    // one giant pseudo-sentence.
     let prose_text = prose_lines.join("\n");
-    let sentences = segment_sentences(&prose_text);
+    let merge_lines = !matches!(kind, LintKind::SlashSource | LintKind::HashSource);
+    let sentences = segment_sentences(&prose_text, merge_lines);
     let paragraphs = segment_paragraphs(&prose_text, &sentences);
 
     // 3. Run each enabled rule and collect violations.
@@ -54,9 +56,21 @@ pub fn lint(kind: LintKind, text: &str, config: &LintConfig) -> LintReport {
         violations.extend(check_sentence_length(&sentences, max_sentence_words, sev));
     }
 
-    // Paragraph-length
+    // Paragraph-length. The cap is configurable via
+    // `max_paragraph_sentences`. Source kinds default off, because
+    // their comments are sparse. Prose kinds default to 6.
     if let Some(sev) = config.resolve_rule("paragraph-length") {
-        violations.extend(check_paragraph_length(&paragraphs, sev));
+        let source_kind = matches!(kind, LintKind::SlashSource | LintKind::HashSource);
+        let max = config.max_paragraph_sentences.unwrap_or_else(|| {
+            if source_kind {
+                0
+            } else {
+                6
+            }
+        });
+        if max > 0 {
+            violations.extend(check_paragraph_length(&paragraphs, max, sev));
+        }
     }
 
     // Contraction
@@ -441,11 +455,17 @@ fn find_comment_start(line: &str) -> Option<usize> {
 }
 
 /// Extract `#` comment lines from source code.
+///
+/// A shebang line (`#!`) is code, not prose. It is skipped, so its
+/// `!` never acts as a sentence terminator.
 fn extract_hash_comments(text: &str) -> Vec<String> {
     text.lines()
         .filter_map(|line| {
             let trimmed = line.trim_start();
-            if trimmed.starts_with('#') {
+            if trimmed.starts_with("#!") {
+                // A shebang. Code, not prose.
+                None
+            } else if trimmed.starts_with('#') {
                 let comment = &trimmed[1..].trim();
                 Some(comment.to_string())
             } else {
@@ -487,22 +507,26 @@ fn check_sentence_length(
         .collect()
 }
 
-/// Check paragraph-length violations (> 6 sentences).
+/// Check paragraph-length violations. `max_sentences` is the
+/// per-paragraph cap. A cap of zero disables the check.
 fn check_paragraph_length(
     paragraphs: &[crate::types::Paragraph],
+    max_sentences: usize,
     severity: Severity,
 ) -> Vec<Violation> {
-    const MAX_SENTENCES: usize = 6;
+    if max_sentences == 0 {
+        return Vec::new();
+    }
     paragraphs
         .iter()
-        .filter(|p| p.sentences.len() > MAX_SENTENCES)
+        .filter(|p| p.sentences.len() > max_sentences)
         .map(|p| Violation {
             rule_id: "paragraph-length",
             severity,
             message: format!(
                 "Paragraph has {} sentences; the maximum is {}.",
                 p.sentences.len(),
-                MAX_SENTENCES
+                max_sentences
             ),
             suggestions: None,
             line: p.line,
@@ -973,5 +997,113 @@ mod tests {
         // the semicolon on line 1 is NOT suppressed.
         assert_eq!(semi.len(), 1);
         assert_eq!(semi[0].line, 1);
+    }
+
+    #[test]
+    fn hash_source_shebang_and_dotted_code_are_excluded() {
+        let config = LintConfig::default();
+        let text = "#!/bin/sh\n# Watch the run.idle window now.\n# Bind 127.0.0.1 and v1.2 here.\n";
+        let report = lint(LintKind::HashSource, text, &config);
+        assert_eq!(report.summary.total, 0, "{report:?}");
+    }
+
+    #[test]
+    fn commit_body_with_dotted_identifier_passes() {
+        let config = LintConfig::default();
+        let report = lint(LintKind::CommitMessage, "Fix the run.idle continue path", &config);
+        assert_eq!(report.summary.total, 0, "{report:?}");
+    }
+
+    #[test]
+    fn hash_source_many_comments_pass_paragraph_length() {
+        // 20 comment lines, 8 with a dotted identifier. The source
+        // kinds default the paragraph cap off, so the file passes.
+        let config = LintConfig::default();
+        let lines: Vec<String> = (0..20)
+            .map(|i| {
+                if i < 12 {
+                    "# Watch the window state now.".to_string()
+                } else {
+                    format!("# The run.idle window {i} is open.")
+                }
+            })
+            .collect();
+        let text = lines.join("\n");
+        let report = lint(LintKind::HashSource, &text, &config);
+        assert!(
+            !report
+                .violations
+                .iter()
+                .any(|v| v.rule_id == "paragraph-length"),
+            "{report:?}"
+        );
+    }
+
+    #[test]
+    fn source_comment_lines_do_not_merge_into_pseudo_sentences() {
+        // A run of period-free comment lines must not build one long
+        // pseudo-sentence. Source kinds close each comment line as
+        // its own sentence.
+        let config = LintConfig::default();
+        let lines: Vec<String> = (0..3)
+            .map(|i| format!("# one two three four five six seven eight nine ten eleven twelve {i}"))
+            .collect();
+        let text = lines.join("\n");
+        let report = lint(LintKind::HashSource, &text, &config);
+        assert!(
+            !report
+                .violations
+                .iter()
+                .any(|v| v.rule_id == "sentence-length"),
+            "{report:?}"
+        );
+    }
+
+    #[test]
+    fn paragraph_cap_is_configurable() {
+        let mut config = LintConfig::default();
+        let text = "One. Two. Three. Four. Five. Six. Seven. Eight.\n";
+        // Prose kinds default to a cap of 6.
+        let report = lint(LintKind::ProseFile, text, &config);
+        assert!(
+            report
+                .violations
+                .iter()
+                .any(|v| v.rule_id == "paragraph-length"),
+            "{report:?}"
+        );
+        config.max_paragraph_sentences = Some(8);
+        let report = lint(LintKind::ProseFile, text, &config);
+        assert!(
+            !report
+                .violations
+                .iter()
+                .any(|v| v.rule_id == "paragraph-length"),
+            "{report:?}"
+        );
+        // A cap of zero disables the rule.
+        config.max_paragraph_sentences = Some(0);
+        let report = lint(LintKind::ProseFile, text, &config);
+        assert!(
+            !report
+                .violations
+                .iter()
+                .any(|v| v.rule_id == "paragraph-length"),
+            "{report:?}"
+        );
+    }
+
+    #[test]
+    fn source_kind_paragraph_cap_is_off_by_default() {
+        let config = LintConfig::default();
+        let text = "# One. # Two. # Three. # Four. # Five. # Six. # Seven. # Eight.\n";
+        let report = lint(LintKind::HashSource, text, &config);
+        assert!(
+            !report
+                .violations
+                .iter()
+                .any(|v| v.rule_id == "paragraph-length"),
+            "{report:?}"
+        );
     }
 }

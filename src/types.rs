@@ -70,6 +70,12 @@ pub struct LintConfig {
     pub rules: BTreeMap<String, String>,
     /// Maximum words per sentence.
     pub max_sentence_words: Option<usize>,
+    /// Maximum sentences per paragraph.
+    ///
+    /// `None` uses the kind default: 6 for prose kinds, off for
+    /// source kinds (their comments are sparse). `Some(0)` disables
+    /// the paragraph-length rule. Any `Some(n)` sets the cap to `n`.
+    pub max_paragraph_sentences: Option<usize>,
     /// Whether to exempt block-quoted content from linting.
     #[serde(default)]
     pub exempt_block_quotes: bool,

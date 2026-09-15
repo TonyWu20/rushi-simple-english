@@ -43,5 +43,13 @@ mod tests {
         let config = LintConfig::default();
         assert!(config.rules.is_empty());
         assert!(config.max_sentence_words.is_none());
+        assert!(config.max_paragraph_sentences.is_none());
+    }
+
+    #[test]
+    fn paragraph_cap_parses_from_json() {
+        let raw = r#"{"max_paragraph_sentences": 8}"#;
+        let config: LintConfig = serde_json::from_str(raw).unwrap();
+        assert_eq!(config.max_paragraph_sentences, Some(8));
     }
 }
