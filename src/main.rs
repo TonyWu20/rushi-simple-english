@@ -15,9 +15,17 @@
 //!   `request.prompt_fragments`, plus any pending reply-gate
 //!   feedback from the previous `run.idle` evaluation.
 //! - **`run.idle`** — lints the last assistant reply.  When hard
-//!   violations are found, the loop is continued with a correction
-//!   prompt so the model revises its reply.  The result is written to
-//!   a state file that the TUI status widget reads.
+//!   violations are found, the loop is continued with a silent
+//!   refire (`log_message: false` + `refire: true`, kernel issues
+//!   #4 and #6): the loop runs a model turn in place and logs no
+//!   user message at all.  The correction prompt is carried to that
+//!   refired call by this hook's `model.before` prompt fragment, so
+//!   the model revises the gated reply within the same run.  The
+//!   kernel bounds the silent loop (`[run] max_silent_refires`,
+//!   default 2); when refire is unsupported or disabled the pending
+//!   feedback simply waits for the next model call.  The lint
+//!   result is written to a state file that the TUI status widget
+//!   reads.
 //!
 //! ## Protocol
 //!
@@ -31,11 +39,21 @@
 //!   the model request (model.before only).
 //! - `{"decision":"continue","payload":{"message":"..."}}` — inject a
 //!   follow-up user message and continue the loop (run.idle only).
+//! - `{"decision":"continue","payload":{"log_message":false}}` —
+//!   continue the loop without logging a follow-up user message
+//!   (kernel issue #4). The hook routes its own text to the model
+//!   through the `model.before` transform.
+//! - `{"decision":"continue","payload":{"log_message":false,
+//!   "refire":true}}` — continue the loop and run a model turn in
+//!   place, logging no user message at all (kernel issue #6). This
+//!   hook routes the correction prompt to the refired call through
+//!   the `model.before` transform. Bounded by the kernel's `[run]
+//!   max_silent_refires` (default 2; 0 disables).
 //!
 //! Exit codes: 0 = success, 2 = blocking default for the window.
 
 use std::io::Read;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use serde_json::json;
 
@@ -339,9 +357,16 @@ fn handle_model_before(payload: &serde_json::Value) {
 ///   `events.jsonl`.
 /// - Lints the reply text as `ProseFile`.
 /// - Writes the hard/soft counts to a state file for the TUI widget.
-/// - Emits a `continue` decision with a correction prompt when hard
-///   violations are found and the reply has not been gated yet. The
-///   model then revises the reply in the next loop iteration.
+/// - Emits a silent refire `continue` (`log_message: false`,
+///   `refire: true`, kernel issues #4 and #6) when hard violations
+///   are found. The reply must not have been gated yet. The loop
+///   runs a model turn in place and logs no user message at all; the
+///   correction prompt is delivered to that refired call through
+///   this hook's `model.before` prompt fragment, so the model
+///   revises the reply within the same run. The kernel's per-run
+///   cap (`[run] max_silent_refires`, default 2) bounds the silent
+///   loop; when refire is unsupported or disabled the pending
+///   feedback waits for the next model call instead.
 /// - Emits `{}` otherwise (the window default is `stop`).
 fn handle_run_idle(payload: &serde_json::Value) {
     let session_dir = match resolve_session_dir(payload) {
@@ -352,17 +377,23 @@ fn handle_run_idle(payload: &serde_json::Value) {
         }
     };
 
+    let resp = run_idle_decision(&session_dir, &config::load_config());
+    println!("{resp}");
+}
+
+/// Compute the `run.idle` decision for one session and persist the
+/// updated state file. Pure w.r.t. stdout so it is unit-testable.
+fn run_idle_decision(
+    session_dir: &Path,
+    config: &types::LintConfig,
+) -> serde_json::Value {
     // Read the last assistant message with non-empty content.
-    let reply_text = match reply::read_last_assistant_message(&session_dir) {
+    let reply_text = match reply::read_last_assistant_message(session_dir) {
         Some(t) => t,
-        None => {
-            println!("{}", json!({}));
-            return;
-        }
+        None => return json!({}),
     };
 
-    let config = config::load_config();
-    let report = engine::lint(LintKind::ProseFile, &reply_text, &config);
+    let report = engine::lint(LintKind::ProseFile, &reply_text, config);
 
     let hard_count = report
         .violations
@@ -378,7 +409,7 @@ fn handle_run_idle(payload: &serde_json::Value) {
     // A stable identity lets the hook gate a given reply at most once.
     let identity = reply::reply_identity(&reply_text);
 
-    let mut state = reply::load_state(&session_dir).unwrap_or_default();
+    let mut state = reply::load_state(session_dir).unwrap_or_default();
 
     // Record this reply for the TUI widget.
     state.hard = hard_count;
@@ -422,34 +453,44 @@ fn handle_run_idle(payload: &serde_json::Value) {
         let feedback = format!(
             "Your last reply was blocked by the writing rules \
              ({} hard violation(s){soft_note}). \
-             Fix the issues below and reply again.\n\n\
+             Revise that reply to fix the issues below.\n\n\
              Hard violations:\n{hard_text}{soft_text}",
             hard_count
         );
 
-        state.pending_feedback = Some(feedback.clone());
+        state.pending_feedback = Some(feedback);
         state.gate_count += 1;
         state.record_gated(&identity);
 
-        let _ = reply::save_state(&session_dir, &state);
+        let _ = reply::save_state(session_dir, &state);
 
-        let resp = json!({
+        // Silent refire (kernel issue #4 + #6): the loop stays alive
+        // and runs a model turn in place, logging no user message at
+        // all — not even an empty one. The correction prompt above is
+        // picked up by this hook's `model.before` transform on that
+        // refired call, so the model revises the gated reply within
+        // the same run. The kernel's per-run cap (`[run]
+        // max_silent_refires`, default 2) bounds the silent loop; when
+        // the running kernel lacks the flag or has it disabled, the
+        // pending feedback waits for the next model call instead
+        // (the issue #4 fallback).
+        return json!({
             "decision": "continue",
-            "payload": {
-                "message": feedback,
-            }
+            "payload": { "log_message": false, "refire": true }
         });
-        println!("{resp}");
-    } else {
-        // Clean reply, or this reply was already gated: allow the
-        // stop.
-        if hard_count == 0 {
-            state.gate_count = 0;
-        }
-        state.pending_feedback = None;
-        let _ = reply::save_state(&session_dir, &state);
-        println!("{}", json!({}));
     }
+
+    // Clean reply, or this reply was already gated: allow the stop.
+    // A clean reply settles the gate chain. An already-gated reply
+    // (the silent re-fire of a continued idle) must keep
+    // pending_feedback so the `model.before` transform still delivers
+    // it on the next model call.
+    if hard_count == 0 {
+        state.gate_count = 0;
+        state.pending_feedback = None;
+    }
+    let _ = reply::save_state(session_dir, &state);
+    json!({})
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────
@@ -594,6 +635,12 @@ fn print_help() {
     println!(
         "  {{\"decision\":\"continue\",\"payload\":{{\"message\":\"...\"}}}} — inject follow-up, continue loop"
     );
+    println!(
+        "  {{\"decision\":\"continue\",\"payload\":{{\"log_message\":false}}}} — continue loop, log no follow user message"
+    );
+    println!(
+        "  {{\"decision\":\"continue\",\"payload\":{{\"log_message\":false,\"refire\":true}}}} — silent refire: run a model turn in place, log no user message (kernel #4 + #6)"
+    );
     println!("Exit codes: 0 = ok, 2 = blocking default");
     println!();
     println!("Config: .simple-english.json in cwd or $SIMPLE_ENGLISH_CONFIG");
@@ -638,5 +685,127 @@ mod tests {
     fn display_path_falls_back_to_path() {
         let args = json!({"path": "docs/a.md"});
         assert_eq!(get_display_path(&args, "edit"), "docs/a.md");
+    }
+
+    /// Seed a session dir with one user turn and one assistant reply.
+    fn seed_session(dir: &Path, reply: &str) {
+        let user = r#"{"v":1,"type":"user_message","ts":"t","content":"do the task"}"#;
+        let asst = format!(
+            "{{\"v\":1,\"type\":\"assistant_message\",\"ts\":\"t\",\"content\":{}}}",
+            json!(reply)
+        );
+        std::fs::write(dir.join("events.jsonl"), format!("{user}\n{asst}\n")).unwrap();
+    }
+
+    /// Append a fresh assistant reply, as a refired model turn would.
+    fn append_assistant(dir: &Path, reply: &str) {
+        let asst = format!(
+            "{{\"v\":1,\"type\":\"assistant_message\",\"ts\":\"t\",\"content\":{}}}",
+            json!(reply)
+        );
+        use std::io::Write;
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(dir.join("events.jsonl"))
+            .unwrap()
+            .write_all(format!("{asst}\n").as_bytes())
+            .unwrap();
+    }
+
+    #[test]
+    fn run_idle_gates_silently_on_hard_violation() {
+        // A 27-word sentence breaches the default 25-word cap (hard).
+        // Seven sentences in one paragraph breach the default six.
+        let dir = tempfile::tempdir().unwrap();
+        seed_session(dir.path(), "One. Two. Three. Four. Five. Six. Seven.");
+        let config = types::LintConfig::default();
+        let resp = run_idle_decision(dir.path(), &config);
+        assert_eq!(resp["decision"], "continue");
+        assert_eq!(resp["payload"]["log_message"], false);
+        assert_eq!(resp["payload"]["refire"], true);
+        // No visible user message is requested: the correction rides
+        // the model.before fragment of the refired call instead.
+        assert!(resp["payload"].get("message").is_none());
+        let state = reply::load_state(dir.path()).unwrap();
+        assert!(state.hard >= 1);
+        assert_eq!(state.gate_count, 1);
+        assert!(state
+            .pending_feedback
+            .as_ref()
+            .unwrap()
+            .contains("Hard violations"));
+    }
+
+    #[test]
+    fn run_idle_stops_on_clean_reply() {
+        let dir = tempfile::tempdir().unwrap();
+        seed_session(dir.path(), "The fix is complete.");
+        let config = types::LintConfig::default();
+        let resp = run_idle_decision(dir.path(), &config);
+        assert_eq!(resp, json!({}));
+        let state = reply::load_state(dir.path()).unwrap();
+        assert_eq!(state.hard, 0);
+        assert!(state.pending_feedback.is_none());
+    }
+
+    #[test]
+    fn run_idle_refire_keeps_pending_feedback() {
+        // After a silent continue the loop re-fires run.idle on the
+        // same reply. The reply is already gated, so the hook stops,
+        // but pending_feedback must survive for the model.before
+        // transform.
+        // Seven sentences in one paragraph breach the default six.
+        let dir = tempfile::tempdir().unwrap();
+        seed_session(dir.path(), "One. Two. Three. Four. Five. Six. Seven.");
+        let config = types::LintConfig::default();
+        let first = run_idle_decision(dir.path(), &config);
+        assert_eq!(first["decision"], "continue");
+        let second = run_idle_decision(dir.path(), &config);
+        assert_eq!(second, json!({}));
+        let state = reply::load_state(dir.path()).unwrap();
+        assert!(
+            state.pending_feedback.is_some(),
+            "the refire must not clear pending_feedback"
+        );
+        assert_eq!(state.gate_count, 1, "the refire must not re-gate");
+    }
+
+    #[test]
+    fn run_idle_gate_chain_on_new_replies() {
+        // The refire chain: each revised reply is a new identity, so
+        // the gate keeps requesting refires, until MAX_GATE_COUNT
+        // consecutive gates are reached and the hook lets the loop
+        // stop (the kernel's own refire cap usually fires earlier).
+        let dir = tempfile::tempdir().unwrap();
+        seed_session(dir.path(), "One. Two. Three. Four. Five. Six. Seven.");
+        let config = types::LintConfig::default();
+        let mut decisions = Vec::new();
+        let mut n = 1;
+        for _ in 0..5 {
+            let d = run_idle_decision(dir.path(), &config);
+            decisions.push(d.clone());
+            if d["decision"].as_str() == Some("continue") {
+                // The refired model turn produces a new reply that
+                // still breaches the paragraph cap.
+                n += 1;
+                append_assistant(
+                    dir.path(),
+                    &format!("Revised {n}. One. Two. Three. Four. Five. Six. Seven."),
+                );
+            }
+        }
+        // Three refires, then stop at the MAX_GATE_COUNT limit.
+        assert_eq!(decisions.len(), 5);
+        for d in &decisions[..3] {
+            assert_eq!(d["decision"], "continue");
+            assert_eq!(d["payload"]["refire"], true);
+        }
+        assert_eq!(decisions[3], json!({}));
+        assert_eq!(decisions[4], json!({}));
+        let state = reply::load_state(dir.path()).unwrap();
+        assert_eq!(state.gate_count, 3);
+        assert!(state.pending_feedback.is_some(),
+            "the stopped chain keeps its feedback for the next model call");
     }
 }

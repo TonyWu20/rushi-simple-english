@@ -72,11 +72,20 @@ content) are linted in full.
 
 ## Reply gating (`run.idle`)
 
-When the loop goes idle, the hook lints the last assistant reply. If
-hard violations are found, it emits a `continue` decision with a
-correction prompt so the model rewrites its reply. Each reply identity
-can be gated at most once (max 3 consecutive gates) to prevent infinite
-loops.
+When the loop goes idle, the hook lints the last assistant reply.
+On hard violations it emits a silent refire continue
+(`log_message: false` + `refire: true`, kernel issues #4 and #6).
+
+- No user message is logged, so the TUI main view stays clean.
+- The correction prompt rides the `model.before` fragment on the
+  refired call. The model revises the reply within the same run.
+- The TUI row widget shows the counts until the reply is clean.
+- The kernel caps silent refires per run (`[run] max_silent_refires`,
+  default 2).
+- Each reply identity can be gated at most once. Up to 3 consecutive
+  gates run before the hook stops.
+- When the cap is hit, pending feedback waits for the next model
+  call instead.
 
 State is persisted in `<session>/simple-english-state.json`.
 
