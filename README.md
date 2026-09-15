@@ -21,7 +21,7 @@ prose, file edits, and git commit messages.
 | `contraction`                   | hard     | `'re`, `'ve`, `'ll`, `'d`, `'m`, `'s` contractions |
 | `semicolon`                     | hard     | Any `;` in prose (fenced code is skipped) |
 | `sentence-length`               | hard     | Sentences over 25 words         |
-| `paragraph-length`              | hard     | Paragraphs over 6 sentences     |
+| `paragraph-length`              | hard     | Paragraphs over the cap. Prose defaults to 6. Source kinds default off. |
 | `phrasal-verb`                  | hard     | "carry out", "spin up", etc.    |
 | `dictionary-not-approved-word`  | hard     | ASD-STE100 not-approved words   |
 | `invalid-suppression`           | hard     | Bad `ste-disable-next-line`     |
@@ -39,6 +39,12 @@ spaces. Lines inside the fence are not linted. A backtick code span
 is also skipped. A span holds one line. This keeps rules such as
 `semicolon` from tripping on code.
 
+Sentence splitting is code-aware. Dotted identifiers like `run.idle`
+and numeric literals like `127.0.0.1` do not end sentences.
+A `#!` shebang at line start is code, not prose.
+Source-file comment lines close their own sentences. A run of
+period-free comment lines must not grow into one giant sentence.
+
 ## Config
 
 Place `.simple-english.json` in the project root or set
@@ -48,9 +54,14 @@ Place `.simple-english.json` in the project root or set
 {
   "rules": { "semicolon": "soft" },
   "max_sentence_words": 20,
+  "max_paragraph_sentences": 8,
   "exempt_block_quotes": true
 }
 ```
+
+Set `max_paragraph_sentences` to change the paragraph cap.
+Use 0 to turn the rule off.
+Prose kinds default to 6. Source kinds default off.
 
 ## Diff-aware linting
 

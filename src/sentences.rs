@@ -19,10 +19,14 @@ const CLOSING_DELIMS: &[char] = &[
     '"', '\u{201d}', '\u{00bb}', '\u{203a}', ')', ']', '}',
 ];
 
-/// Segment `text` into sentences. Each sentence carries its 1-based line
-/// number, 1-based column of its first non-whitespace character, and the
-/// word count.
-pub fn segment_sentences(text: &str) -> Vec<Sentence> {
+/// Segment `text` into sentences. Each sentence carries its 1-based
+/// line number, 1-based column of its first non-whitespace character,
+/// and the word count.
+///
+/// When `merge_lines` is false, each line closes its own sentence.
+/// The source kinds pass false. Their comment lines stay separate, so
+/// a long run of period-free lines cannot build one giant sentence.
+pub fn segment_sentences(text: &str, merge_lines: bool) -> Vec<Sentence> {
     let lines: Vec<&str> = text.split('\n').collect();
     let mut sentences: Vec<Sentence> = Vec::new();
     let mut open: Option<(usize, usize)> = None; // (line_idx, col)
@@ -116,6 +120,15 @@ pub fn segment_sentences(text: &str) -> Vec<Sentence> {
             close_sentence(&mut sentences, &mut parts, sl, sc);
             open = None;
         }
+
+        // Source kinds pass merge_lines = false. Each extracted
+        // comment line closes its own sentence, so no run of
+        // period-free lines grows into one giant pseudo-sentence.
+        if !merge_lines && !parts.is_empty() {
+            let (sl, sc) = open.unwrap_or((i, 0));
+            close_sentence(&mut sentences, &mut parts, sl, sc);
+            open = None;
+        }
     }
 
     if let Some((l, c)) = open {
@@ -123,6 +136,12 @@ pub fn segment_sentences(text: &str) -> Vec<Sentence> {
     }
 
     sentences
+}
+
+/// A word character for the dotted-identifier guard: an ASCII letter,
+/// a digit, or an underscore.
+fn is_word_char(c: char) -> bool {
+    c == '_' || c.is_ascii_alphanumeric()
 }
 
 /// Returns `(start, end)` byte ranges in `line` where a sentence ends.
@@ -141,6 +160,23 @@ fn sentence_ends(line: &str) -> Vec<(usize, usize)> {
         match ch {
             '.' | '!' | '?' | '\u{3002}' | '\u{ff01}' | '\u{ff1f}' => {
                 let start = i;
+                // Dotted identifiers and numeric literals are code.
+                // A dot with word characters on both sides is an
+                // identifier separator, not a sentence end.
+                // A dot after a digit is an IP or version piece.
+                if ch == '.' {
+                    let before = line[..start].chars().next_back();
+                    let after = line[start + 1..].chars().next();
+                    let identifier_dot =
+                        before.is_some_and(is_word_char) && after.is_some_and(is_word_char);
+                    let numeric_dot = before.is_some_and(|c| c.is_ascii_digit());
+                    if identifier_dot || numeric_dot {
+                        i += 1;
+                        continue;
+                    }
+                }
+                // A `#!` shebang at line start is code, not prose.
+                let shebang = ch == '!' && start == 1 && line.starts_with("#!");
                 let mut end = i + ch_bytes;
                 // Consume consecutive terminators: "..." "?!?!" "。！"
                 while end < len {
@@ -167,7 +203,7 @@ fn sentence_ends(line: &str) -> Vec<(usize, usize)> {
                     before.ends_with(abbr)
                 });
 
-                if !is_abbrev {
+                if !is_abbrev && !shebang {
                     ends.push((start, end));
                 }
                 i = end;
@@ -364,7 +400,7 @@ mod tests {
 
     #[test]
     fn two_simple_sentences() {
-        let sents = segment_sentences("Hello world. How are you?");
+        let sents = segment_sentences("Hello world. How are you?", true);
         assert_eq!(sents.len(), 2);
         assert_eq!(sents[0].text, "Hello world.");
         assert_eq!(sents[1].text, "How are you?");
@@ -372,7 +408,7 @@ mod tests {
 
     #[test]
     fn word_count() {
-        let sents = segment_sentences("One two three.");
+        let sents = segment_sentences("One two three.", true);
         assert_eq!(sents[0].word_count, 3);
     }
 
@@ -380,6 +416,7 @@ mod tests {
     fn multi_line_sentence() {
         let sents = segment_sentences(
             "This is a long sentence that\nspans multiple lines.",
+            true,
         );
         assert_eq!(sents.len(), 1);
         assert_eq!(
@@ -391,7 +428,7 @@ mod tests {
     #[test]
     fn paragraphs_split_by_blank_line() {
         let text = "First para one.\nSecond sentence.\n\nNew para.";
-        let sents = segment_sentences(text);
+        let sents = segment_sentences(text, true);
         let paras = segment_paragraphs(text, &sents);
         assert_eq!(paras.len(), 2);
         assert_eq!(paras[0].sentences.len(), 2);
@@ -401,7 +438,7 @@ mod tests {
     #[test]
     fn paragraphs_crlf() {
         let text = "Line one.\r\nLine two.\r\n\r\nLine three.";
-        let sents = segment_sentences(text);
+        let sents = segment_sentences(text, true);
         let paras = segment_paragraphs(text, &sents);
         assert_eq!(paras.len(), 2);
         assert_eq!(paras[0].line, 1);
@@ -411,7 +448,7 @@ mod tests {
     #[test]
     fn paragraphs_whitespace_only_line_breaks() {
         let text = "Para one.\n   \nPara two.";
-        let sents = segment_sentences(text);
+        let sents = segment_sentences(text, true);
         let paras = segment_paragraphs(text, &sents);
         assert_eq!(paras.len(), 2);
     }
@@ -419,7 +456,7 @@ mod tests {
     #[test]
     fn paragraphs_multiple_sentences_line_numbers() {
         let text = "S one.\nS two.\n\nS three.\nS four.\nS five.";
-        let sents = segment_sentences(text);
+        let sents = segment_sentences(text, true);
         let paras = segment_paragraphs(text, &sents);
         assert_eq!(paras.len(), 2);
         assert_eq!(paras[0].line, 1);
@@ -430,7 +467,7 @@ mod tests {
 
     #[test]
     fn empty_text() {
-        let sents = segment_sentences("");
+        let sents = segment_sentences("", true);
         assert!(sents.is_empty());
     }
 
@@ -441,7 +478,7 @@ mod tests {
     #[test]
     fn multibyte_chars_before_terminator() {
         let line = "- **`table_grid`** (rewritten) \u{2014} wide cells wrap, truncated with `\u{2026}`. A data row spans.";
-        let sents = segment_sentences(line);
+        let sents = segment_sentences(line, true);
         // Two sentences: the first ends at the '.' after the ellipsis,
         // the second is the tail. Before the byte-index fix this panicked
         // because the char index was sliced as a byte index mid-'…'.
@@ -460,14 +497,14 @@ mod tests {
         // count as a word. Consecutive quote lines accumulate into
         // one sentence (same as a wrapped paragraph).
         let text = "> quoted first line\n> second quoted line.\n";
-        let sents = segment_sentences(text);
+        let sents = segment_sentences(text, true);
         assert_eq!(sents.len(), 1);
         assert_eq!(sents[0].text, "quoted first line second quoted line.");
     }
 
     #[test]
     fn cjk_sentence() {
-        let sents = segment_sentences("你好世界。这是测试！");
+        let sents = segment_sentences("你好世界。这是测试！", true);
         assert_eq!(sents.len(), 2);
         assert_eq!(sents[0].text, "你好世界。");
         assert_eq!(sents[1].text, "这是测试！");
@@ -478,7 +515,7 @@ mod tests {
         // Regression: no-period bullet lines must not accumulate into one
         // long pseudo-sentence across list items.
         let text = "- First item with no period\n- Second item with no period\n- Third item with no period\n";
-        let sents = segment_sentences(text);
+        let sents = segment_sentences(text, true);
         // Each bullet is its own sentence (3), not one merged 21-word sentence.
         assert_eq!(sents.len(), 3);
         for s in &sents {
@@ -491,7 +528,7 @@ mod tests {
         // Regression: consecutive numbered list items are separate blocks,
         // so a long numbered list must not read as one giant paragraph.
         let text = "1. First item passes.\n2. Second item passes.\n3. Third item passes.\n4. Fourth item passes.\n5. Fifth item passes.\n6. Sixth item passes.\n7. Seventh item passes.\n";
-        let sents = segment_sentences(text);
+        let sents = segment_sentences(text, true);
         let paras = segment_paragraphs(text, &sents);
         assert!(paras.len() >= 7, "each list item should be its own paragraph, got {}", paras.len());
         assert!(paras
@@ -504,7 +541,7 @@ mod tests {
         // Regression: consecutive bullets are separate blocks, so a 7-item
         // list must not read as one 7-sentence paragraph.
         let text = "- One.\n- Two.\n- Three.\n- Four.\n- Five.\n- Six.\n- Seven.\n";
-        let sents = segment_sentences(text);
+        let sents = segment_sentences(text, true);
         let paras = segment_paragraphs(text, &sents);
         assert_eq!(paras.len(), 7);
         assert!(paras
@@ -518,7 +555,7 @@ mod tests {
         // The `##` marker is stripped from the sentence text, and the
         // heading must not merge with the body line that follows it.
         let text = "Intro text.\n## Section heading with many trailing words here\nBody line after the heading follows here.\n";
-        let sents = segment_sentences(text);
+        let sents = segment_sentences(text, true);
         assert_eq!(sents[0].text, "Intro text.");
         assert_eq!(sents.len(), 3);
         let heading = sents
@@ -529,5 +566,48 @@ mod tests {
         // the body line that follows it.
         assert!(!heading.text.contains("Body line"));
         assert_eq!(sents[2].text, "Body line after the heading follows here.");
+    }
+
+    #[test]
+    fn dotted_identifiers_do_not_split() {
+        // `run.idle` and `e2e.sh` are dotted identifiers. Their dots
+        // carry word characters on both sides, so they do not end a
+        // sentence. Only the trailing period splits.
+        let sents = segment_sentences("Use run.idle and e2e.sh now.", true);
+        assert_eq!(sents.len(), 1, "{sents:?}");
+        assert_eq!(sents[0].text, "Use run.idle and e2e.sh now.");
+    }
+
+    #[test]
+    fn numeric_literals_do_not_split() {
+        // `127.0.0.1` and `v1.2` are numeric literals. A dot whose
+        // left side ends in a digit is an IP or version piece, not a
+        // terminator.
+        let sents = segment_sentences("Bind 127.0.0.1 and v1.2 now.", true);
+        assert_eq!(sents.len(), 1, "{sents:?}");
+        assert_eq!(sents[0].text, "Bind 127.0.0.1 and v1.2 now.");
+    }
+
+    #[test]
+    fn shebang_line_does_not_split() {
+        // A `#!` shebang at line start is code. Its `!` does not
+        // end a sentence: no terminator sits in the line at all.
+        assert!(sentence_ends("#!/bin/sh").is_empty());
+        let sents = segment_sentences("#!/bin/sh", true);
+        assert_eq!(sents.len(), 1, "{sents:?}");
+        assert_eq!(sents[0].text, "#!/bin/sh");
+    }
+
+    #[test]
+    fn source_mode_keeps_comment_lines_separate() {
+        // merge_lines = false: each line closes its own sentence. A
+        // run of period-free lines must not build one giant
+        // pseudo-sentence.
+        let text = "alpha beta\ngamma delta\ndelta zeta.";
+        let sents = segment_sentences(text, false);
+        assert_eq!(sents.len(), 3, "{sents:?}");
+        assert_eq!(sents[0].text, "alpha beta");
+        let merged = segment_sentences(text, true);
+        assert_eq!(merged.len(), 1, "{merged:?}");
     }
 }
