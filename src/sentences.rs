@@ -167,8 +167,8 @@ fn sentence_ends(line: &str) -> Vec<(usize, usize)> {
                 if ch == '.' {
                     let before = line[..start].chars().next_back();
                     let after = line[start + 1..].chars().next();
-                    let identifier_dot = before.is_some_and(is_word_char)
-                        && after.is_some_and(is_word_char);
+                    let identifier_dot =
+                        before.is_some_and(is_word_char) && after.is_some_and(is_word_char);
                     let numeric_dot = before.is_some_and(|c| c.is_ascii_digit());
                     if identifier_dot || numeric_dot {
                         i += 1;

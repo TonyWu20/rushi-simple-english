@@ -61,13 +61,9 @@ pub fn lint(kind: LintKind, text: &str, config: &LintConfig) -> LintReport {
     // their comments are sparse. Prose kinds default to 6.
     if let Some(sev) = config.resolve_rule("paragraph-length") {
         let source_kind = matches!(kind, LintKind::SlashSource | LintKind::HashSource);
-        let max = config.max_paragraph_sentences.unwrap_or_else(|| {
-            if source_kind {
-                0
-            } else {
-                6
-            }
-        });
+        let max = config
+            .max_paragraph_sentences
+            .unwrap_or_else(|| if source_kind { 0 } else { 6 });
         if max > 0 {
             violations.extend(check_paragraph_length(&paragraphs, max, sev));
         }
