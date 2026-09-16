@@ -88,16 +88,29 @@
                 cp ${extToml} $out/${extName}/ext.toml
                 cp -rL ${built}/bin/. $out/${extName}/${binDir}/
               '';
+              # meta.rushi.ext (rushi#13): the UI-ext entry dir this
+              # package provides. lib.mkRushi reads it at eval time.
+              meta = { rushi = { ext = extName; }; };
             };
         # Plain-named bindings so the `default` attr can reference them
         # (hyphenated attr names cannot be referenced by bare identifier).
-        hookPkg = buildCrate {
-          # Hook: a bare buildRustPackage result is a valid hook source.
-          # $out/bin/harness-hook-simple-english → mkRushi copies bin/. →
-          # hooks/. The binary name comes from the crate's [[bin]] name and
-          # must match the command field in config.toml [[hooks.on]].
+        #
+        # Base hook package (guide §4.2): a bare buildRustPackage result is
+        # a valid hook source. $out/bin/harness-hook-simple-english →
+        # mkRushi copies bin/. → hooks/. The binary name comes from the
+        # crate's [[bin]] name and must match the command field in
+        # config.toml [[hooks.on]].
+        hookBase = buildCrate {
           crateDir = ".";
           crateName = "hook-simple-english";
+        };
+        # meta.rushi.bin (rushi#13): the runtime binary name, so a consumer
+        # can derive hook commands without a second typed copy. The merge
+        # preserves any meta buildRustPackage already set on the package.
+        hookPkg = hookBase // {
+          meta = (hookBase.meta or { }) // {
+            rushi = { bin = "harness-hook-simple-english"; };
+          };
         };
         extPkg = wrapAsExt {
           # TUI extension: wrap into $out/simple-english/ext.toml +
