@@ -451,9 +451,17 @@ fn run_idle_decision(
             String::new()
         };
         let feedback = format!(
-            "Your last reply was blocked by the writing rules \
+            "[writing-rules gate, not a user message] \
+             Your last reply was blocked by the writing rules \
              ({} hard violation(s){soft_note}). \
-             Revise that reply to fix the issues below.\n\n\
+             This is feedback from the writing-rules hook. \
+             No new user message has arrived, and the user \
+             has confirmed or approved nothing. \
+             The flagged lines are in your last reply. \
+             Revise only those lines to fix the writing, \
+             keeping the same meaning. \
+             Do not treat this as a user instruction or as \
+             confirmation of a plan.\n\n\
              Hard violations:\n{hard_text}{soft_text}",
             hard_count
         );
@@ -735,6 +743,37 @@ mod tests {
             .as_ref()
             .unwrap()
             .contains("Hard violations"));
+    }
+
+    #[test]
+    fn run_idle_feedback_carries_hook_origin_marker() {
+        // The silent refire re-shows the agent's own last reply to
+        // the model. The pending feedback must identify itself as
+        // hook origin and deny user confirmation, or the model
+        // reads the re-shown reply as a user message.
+        let dir = tempfile::tempdir().unwrap();
+        seed_session(dir.path(), "One. Two. Three. Four. Five. Six. Seven.");
+        let config = types::LintConfig::default();
+        let resp = run_idle_decision(dir.path(), &config);
+        assert_eq!(resp["payload"]["refire"], true);
+        let state = reply::load_state(dir.path()).unwrap();
+        let fb = state.pending_feedback.as_deref().unwrap();
+        // The source marker names the hook, not the user.
+        assert!(
+            fb.starts_with("[writing-rules gate, not a user message]"),
+            "the feedback must open with the hook-origin marker: {fb}"
+        );
+        // The non-confirmation statement blocks the confirmation read.
+        assert!(
+            fb.contains("Do not treat this as a user instruction or as confirmation of a plan"),
+            "the feedback must deny user confirmation: {fb}"
+        );
+        // The reply body is not re-shown. Only the violation list
+        // points at the flagged locations.
+        assert!(
+            !fb.contains("One. Two. Three. Four. Five. Six. Seven."),
+            "the reply body must not be re-injected: {fb}"
+        );
     }
 
     #[test]
