@@ -39,8 +39,10 @@ fn main() {
     let mut out = std::io::LineWriter::new(stdout.lock());
 
     // Resolve the sessions root once at startup, the same way
-    // goal-ext does: the `CONFIG` env var names the harness config
-    // file; `[paths] sessions_root` names the sessions root.
+    // goal-ext does: `[paths] sessions_root` from the config file
+    // named by the `CONFIG` env var; a relative value anchors to
+    // `RUSHI_CWD` (the host working dir) when the host exported it,
+    // else to the config directory.
     let sessions_root = std::env::var("CONFIG")
         .ok()
         .and_then(|c| sessions_root(std::path::Path::new(&c)));
@@ -128,12 +130,21 @@ struct State {
 }
 
 /// Read `[paths] sessions_root` from the config file named by the
-/// `CONFIG` env var. Relative paths resolve against the config
-/// directory. Defaults to `<config_dir>/sessions` when absent.
+/// `CONFIG` env var. A relative value (the common case, e.g.
+/// "sessions") resolves against `RUSHI_CWD` when the TUI host
+/// exported it (the host working dir — the same base the kernel
+/// uses for its session dirs; under a Nix build the config file
+/// lives in the read-only store, so its directory must not be
+/// used). Without `RUSHI_CWD` the config directory is the base.
+/// Defaults to `<base>/sessions` when the key is absent.
 fn sessions_root(config_path: &std::path::Path) -> Option<String> {
     let text = std::fs::read_to_string(config_path).ok()?;
     let v: toml::Value = text.parse().ok()?;
     let config_dir = config_path.parent()?.to_path_buf();
+    let base_dir = std::env::var_os("RUSHI_CWD")
+        .filter(|s| !s.is_empty())
+        .map(std::path::PathBuf::from)
+        .unwrap_or(config_dir);
     if let Some(root) = v
         .get("paths")
         .and_then(|p| p.get("sessions_root"))
@@ -143,10 +154,10 @@ fn sessions_root(config_path: &std::path::Path) -> Option<String> {
         return Some(if p.is_absolute() {
             p.to_string_lossy().into_owned()
         } else {
-            config_dir.join(p).to_string_lossy().into_owned()
+            base_dir.join(p).to_string_lossy().into_owned()
         });
     }
-    Some(config_dir.join("sessions").to_string_lossy().into_owned())
+    Some(base_dir.join("sessions").to_string_lossy().into_owned())
 }
 
 #[cfg(test)]
