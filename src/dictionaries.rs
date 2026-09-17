@@ -107,5 +107,6 @@ pub fn ste_dictionary() -> Vec<PhraseEntry> {
         entry(&["due to the fact that"], &["because"]),
         entry(&["is able to", "are able to"], &["can"]),
         entry(&["make use of", "makes use of"], &["use"]),
+        entry(&["provenance"], &["origin"]),
     ]
 }
