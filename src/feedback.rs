@@ -19,7 +19,7 @@ pub fn format_violations(
                 .suggestions
                 .as_ref()
                 .and_then(|s| s.first())
-                .map(|s| format!(". Suggested fix: use \"{}\".", s))
+                .map(|s| format!(" Suggested fix: use \"{}\".", s))
                 .unwrap_or_default();
             format!(
                 "- line {}, column {} [{}]: {}{}",
