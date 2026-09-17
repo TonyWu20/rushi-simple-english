@@ -41,7 +41,7 @@ and does not contain the original reply body.
 
 **Related (out of scope here)**
 An optional kernel/TUI enhancement would label each refired reply as
-"gated revision n" so a human reader sees the provenance.
+"gated revision n" so a human reader sees the origin.
 That is a kernel-side change and is not part of this fix.
 
 ## FT-002 — Goal `run.idle` refire: model re-posts its own final reply
@@ -119,7 +119,7 @@ Two functions in `goal-state/src/lib.rs` carry the fix.
    It states that the user confirmed or approved nothing.
    This mirrors the FT-001 writing-gate marker.
 2. `build_goal_fragment()` gains a static
-   "Continuation provenance" note. The note is static text.
+   "Continuation origin" note. The note is static text.
    It keeps the fragment byte-stable (P16/P17).
    The note covers the silent-refire case. In that case no message
    is logged. The model only re-sees its own reply.
@@ -137,7 +137,7 @@ pass with the patch applied.
 Apply the patch in `rushi-exts/goal-app`.
 Then build `goal-state`, `hook-goal-idle`, and `hook-goal-arm`.
 Then run `run-idle-continue-e2e.sh` in `rushi-exts`.
-Note: that e2e script still uses the legacy `[paths] tools_root`
-and `extra_tools_roots` keys. The current kernel renamed them to
-`native_tool_paths` and `extension_tool_paths`.
-Update the script before running the suite.
+Note: that e2e script used the legacy `[paths] tools_root` and
+`extra_tools_roots` keys. The kernel renamed them in commit
+353424a. The script now uses `native_tool_paths` and
+`extension_tool_paths`. The suite runs clean.
