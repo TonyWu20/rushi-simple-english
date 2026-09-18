@@ -31,7 +31,7 @@
       # Mirror the kernel flake: fixed system list + genAttrs.
       # Avoid flake-utils.eachDefaultSystem (transposes the result and
       # breaks nix develop / per-system devShells).
-      supportedSystems = [ "x86_64-linux" "aarch64-linux" ];
+      supportedSystems = [ "x86_64-linux" "aarch64-linux" "aarch64-darwin" ];
       pkgLib = nixpkgs.lib;
     in
     {
@@ -92,44 +92,44 @@
               # package provides. lib.mkRushi reads it at eval time.
               meta = { rushi = { ext = extName; }; };
             };
-        # Plain-named bindings so the `default` attr can reference them
-        # (hyphenated attr names cannot be referenced by bare identifier).
-        #
-        # Base hook package (guide §4.2): a bare buildRustPackage result is
-        # a valid hook source. $out/bin/harness-hook-simple-english →
-        # mkRushi copies bin/. → hooks/. The binary name comes from the
-        # crate's [[bin]] name and must match the command field in
-        # config.toml [[hooks.on]].
-        hookBase = buildCrate {
-          crateDir = ".";
-          crateName = "hook-simple-english";
-        };
-        # meta.rushi.bin (rushi#13): the runtime binary name, so a consumer
-        # can derive hook commands without a second typed copy. The merge
-        # preserves any meta buildRustPackage already set on the package.
-        hookPkg = hookBase // {
-          meta = (hookBase.meta or { }) // {
-            rushi = { bin = "harness-hook-simple-english"; };
+          # Plain-named bindings so the `default` attr can reference them
+          # (hyphenated attr names cannot be referenced by bare identifier).
+          #
+          # Base hook package (guide §4.2): a bare buildRustPackage result is
+          # a valid hook source. $out/bin/harness-hook-simple-english →
+          # mkRushi copies bin/. → hooks/. The binary name comes from the
+          # crate's [[bin]] name and must match the command field in
+          # config.toml [[hooks.on]].
+          hookBase = buildCrate {
+            crateDir = ".";
+            crateName = "hook-simple-english";
           };
-        };
-        extPkg = wrapAsExt {
-          # TUI extension: wrap into $out/simple-english/ext.toml +
-          # $out/simple-english/target/release/simple-english-ext.
-          # ext.toml command = "target/release/simple-english-ext" matches
-          # the default binDir.
-          extName = "simple-english";
-          extToml = "${self}/simple-english-ext/ext.toml";
-          built = buildCrate {
-            crateDir = "simple-english-ext";
-            crateName = "simple-english-ext";
+          # meta.rushi.bin (rushi#13): the runtime binary name, so a consumer
+          # can derive hook commands without a second typed copy. The merge
+          # preserves any meta buildRustPackage already set on the package.
+          hookPkg = hookBase // {
+            meta = (hookBase.meta or { }) // {
+              rushi = { bin = "harness-hook-simple-english"; };
+            };
           };
-        };
-      in
-      {
-        "hook-simple-english" = hookPkg;
-        "simple-english-ext" = extPkg;
-        default = hookPkg;
-      }
+          extPkg = wrapAsExt {
+            # TUI extension: wrap into $out/simple-english/ext.toml +
+            # $out/simple-english/target/release/simple-english-ext.
+            # ext.toml command = "target/release/simple-english-ext" matches
+            # the default binDir.
+            extName = "simple-english";
+            extToml = "${self}/simple-english-ext/ext.toml";
+            built = buildCrate {
+              crateDir = "simple-english-ext";
+              crateName = "simple-english-ext";
+            };
+          };
+        in
+        {
+          "hook-simple-english" = hookPkg;
+          "simple-english-ext" = extPkg;
+          default = hookPkg;
+        }
       );
 
       # ── Dev shell: in-tree cargo dev for both crates. ──
