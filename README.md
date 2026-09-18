@@ -11,7 +11,7 @@ prose, file edits, and git commit messages.
 | Window         | Behaviour                                                       |
 |----------------|-----------------------------------------------------------------|
 | `tool.before`  | Lints `write`, `edit`, and `bash` (git commit) calls with diff-aware filtering. |
-| `model.before` | Injects the byte-stable rule summary into `prompt_fragments`. Appends pending reply-gate feedback to the tail of `request.input`. |
+| `model.before` | Injects the byte-stable rule summary into `prompt_fragments`. Does not touch `request.input`. |
 | `run.idle`     | Lints the last assistant reply. Gates the loop on hard violations. |
 
 ## Rules
@@ -73,23 +73,26 @@ content) are linted in full.
 ## Reply gating (`run.idle`)
 
 When the loop goes idle, the hook lints the last assistant reply.
-On hard violations it emits a silent refire continue
-(`log_message: false` + `refire: true`, kernel issues #4 and #6).
+On hard violations it emits a logged follow-up `continue` with a
+`message`. The kernel logs that message as a `user_message` in the
+`follow` queue and drains it as a new model turn. The model revises
+the flagged lines within the same run.
 
-- No user message is logged, so the TUI main view stays clean.
-- The correction prompt rides the `model.before` transform on the
-  refired call. It lands as the last user item of `request.input`.
-  The fragment stays byte-stable, so the cached prompt prefix holds.
-  The model revises the reply within the same run.
+- The follow-up is a genuine `user_message`. The TUI shows it as a
+  user panel. That is the accepted cost of retiring the silent
+  refire mechanism (FT-003).
+- The message lists the hard and soft violations. It tells the model
+  to revise only the flagged lines, keep the meaning, not re-post
+  the reply, and not answer its own open questions.
+- The `model.before` fragment stays byte-stable. It carries the rule
+  summary only, so the cached prompt prefix holds.
 - The TUI row widget shows the counts until the reply is clean.
-- The kernel caps silent refires per run (`[run] max_silent_refires`,
-  default 2).
 - Each reply identity can be gated at most once. Up to 3 consecutive
-  gates run before the hook stops.
-- When the cap is hit, pending feedback waits for the next model
-  call instead.
+  gates run before the hook stops (`MAX_GATE_COUNT`). The run stops
+  with the last violating reply standing.
 
-State is persisted in `<session>/simple-english-state.json`.
+State is persisted in `<session>/simple-english-state.json` (`hard`,
+`soft`, `last_identity`, `gate_count`, `gated_replies`).
 
 ## TUI status widget
 

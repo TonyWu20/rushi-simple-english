@@ -206,41 +206,37 @@ It does not quote the flagged text.
 The model re-derives the report content and misattributes it.
 
 **Fix status**
-Patches prepared 2026-09-19. Not applied. Decision pending.
-Each patch applies to a clean `547bfb8` tree with `git apply`.
+Resolved 2026-09-19 by retiring the silent refire mechanism.
+The user traded TUI conversation cleanliness for transcript
+clarity: a re-presented reply with a marker is not something the
+local model can be reliably told is not a user turn. The fix is to
+stop re-presenting the reply at all.
+
+The gate now returns `continue` with a `message`.
+The kernel logs it as a `user_message` (follow queue).
+The next step drains it as a new model turn.
+The model sees a genuine user instruction, not a re-shown reply.
+No `pending_feedback`, no input-tail injection, no `refire` flag.
+The kernel's `refire` payload flag, `run.refire`/`run.refire_cap`
+markers, and `[run] max_silent_refires` were removed from
+`rust-unix-harness` the same day.
+
+The candidate patches below were superseded and are retired:
 
 1. Role change, in this repo (small).
    Patch: `scratch/ft003-system-role-feedback.patch`.
    Deliver `pending_feedback` as a `system`-role item.
-   The live sglang endpoint accepts `system` and `developer` items
-   in `input`. Verified with curl on 2026-09-19.
-   The kernel chat-completions fallback passes roles through.
-   Cache impact is none. The item stays at the input tail.
-
-   Touches: `model_before_request` (src/main.rs), the unit test,
-   and the e2e assertion. The e2e helper is renamed to
-   `req_tail_is_marker_system_item`.
-   Verified: `cargo test` passes 117/117 with the patch applied.
-   The refire e2e suite passes 19/19 with the patch applied.
+   Superseded: the delivery path it patches no longer exists.
 
 2. Kernel-level feedback channel (larger).
    Add a `feedback` field to the refire decision payload.
-   The kernel injects it as a non-conversational item.
-   This generalizes the fix.
-
-   Goal-mode continuations share this failure mode (see FT-002).
-   This option needs a kernel change and a flake relock.
-   No patch prepared. Design decision pending.
+   Superseded: no refire decision payload exists.
 
 3. Static fragment note (cheap, complements option 1 or 2).
    Patch: `scratch/ft003-fragment-protocol-note.patch`.
-   Add a byte-stable "Refire protocol" section to the fragment.
-   It states the refire protocol.
-   It says the follow-up item is hook feedback, not a user message.
-   It says never to answer its own open questions as user replies.
-   Verified: `cargo test` passes 118/118 with the patch applied.
-   Both patches apply together cleanly. Verified on a worktree.
-   The refire e2e suite passes 19/19 with both applied.
+   Superseded: nothing re-presents the reply, so the protocol note
+   is unnecessary. The guard sentences live in the logged
+   follow-up message instead.
 
 **Open item (cross-repo)**
 The FT-002 patch is still unapplied.
@@ -248,4 +244,7 @@ The FT-002 patch is still unapplied.
 `rushi-exts/goal-app/goal-state/src/lib.rs` has no marker.
 The pinned `rushi-goal-mode` rev `75ffc8c` has no marker either.
 Goal continuations are logged `user_message` items.
-They share this failure mode.
+They now share the same shape as the gate follow-up.
+A probe of the goal continuation text against the live model is
+the next step before deciding whether it needs the guard sentences
+too.

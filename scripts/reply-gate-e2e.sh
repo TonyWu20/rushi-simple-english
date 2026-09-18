@@ -1,9 +1,11 @@
 #!/usr/bin/env bash
-# e2e for the reply-gate silent refire (kernel issue #6): the real
-# harness-hook-simple-english gates a violating reply, the kernel
-# refires the model turn in place with NO user message logged, the
-# hook's model.before transform delivers the correction prompt to
-# that refired call, and the model's clean revision ends the run.
+# e2e for the reply-gate logged follow-up: the real
+# harness-hook-simple-english lints the last assistant reply, and on a
+# hard violation returns `continue` with a `message`. The kernel logs
+# that message as a follow `user_message` and drains it as a new model
+# turn. The model revises the reply within the same run. The silent
+# refire mechanism is retired; no `refire` flag, no `run.refire`
+# marker.
 
 set -uo pipefail
 
@@ -114,8 +116,8 @@ EOF
 }
 
 # The model keeps answering with a violating reply (a fresh one each
-# call, so the gate chain keeps going): proves the cap bounds the
-# silent loop and the feedback survives as the fallback.
+# call, so the gate chain keeps going): proves MAX_GATE_COUNT bounds
+# the logged follow-ups.
 make_stub_violating() {
   printf '%s\n' '#!/usr/bin/env bash' > "$WORK/stub-model"
   cat >> "$WORK/stub-model" <<'EOF'
@@ -127,7 +129,7 @@ if [[ "${1:-}" == "--describe" ]]; then
 fi
 
 req=$(cat)
-printf '%s\n' "$req" >>"${STUB_REQLOG:-/dev/null}"
+printf '%s\n' "$req" >>"${STUB_REQLOG}"
 n=$(wc -l <"${STUB_REQLOG}" | tr -d ' ')
 jq -cn --arg t "One. Two. Three. Four. Five. Six. Seven. (pass $n)" \
   '{text: $t, tool_calls: [], reasoning: [], stop_reason: "stop", usage: {input_tokens: 10, output_tokens: 10}}'
@@ -155,30 +157,34 @@ empty_user_message_count() {
   jq -c 'select(.type == "user_message" and .content == "")' "$SLOG" 2>/dev/null | wc -l | tr -d ' '
 }
 
+gate_message_count() {
+  # The logged follow-up user messages carry the gate text.
+  jq -c 'select(.type == "user_message" and ((.content // "") | contains("writing-rule violation")))' "$SLOG" 2>/dev/null | wc -l | tr -d ' '
+}
+
 count_markers() {
   local n
   n=$(jq -c "select(.type == \"ext_status\" and .id == \"$1\")" "$SLOG" 2>/dev/null | wc -l)
   echo "$n"
 }
 
-req_tail_is_marker_user_item() {
+req_tail_has_gate_text() {
   # $1: line number of the reqlog. True when the last input item is a
-  # user message carrying the hook-origin marker (issue #5
-  # placement rule).
+  # user message carrying the gate follow-up text.
   sed -n "$1p" "$STUB_REQLOG" 2>/dev/null | jq -e '
     (.input | type) == "array"
     and (.input[-1].type == "message")
     and (.input[-1].role == "user")
-    and ((.input[-1].content // "") | contains("[writing-rules gate"))
+    and ((.input[-1].content // "") | contains("writing-rule violation"))
   ' >/dev/null 2>&1
 }
 
-req_instructions_carry_marker() {
+req_instructions_carry_gate_text() {
   # $1: line number of the reqlog. True when instructions carry the
-  # feedback marker. Issue #5 forbids this: the marker must ride the
-  # input tail, not the prompt head.
+  # gate text. The gate text must ride the logged user message, never
+  # the prompt head.
   sed -n "$1p" "$STUB_REQLOG" 2>/dev/null | jq -e '
-    (.instructions // "") | contains("[writing-rules gate")
+    (.instructions // "") | contains("writing-rule violation")
   ' >/dev/null 2>&1
 }
 
@@ -195,7 +201,7 @@ assert_eq() {
 }
 
 NEW_WORK() {
-  WORK="$ROOT/scratch/e2e-refire-reply-gate/$1"
+  WORK="$ROOT/scratch/e2e-reply-gate/$1"
   rm -rf "$WORK"
   SESSIONS_DIR="$WORK/sessions/session"
   SLOG="$SESSIONS_DIR/events.jsonl"
@@ -204,92 +210,78 @@ NEW_WORK() {
   echo "==== scenario: $1"
 }
 
-# A violating reply is gated, the kernel refires the model in place,
-# the refired request carries the correction prompt, and the clean
-# revision ends the run: two model turns, one user_message (the
-# seed), no follow user message, no blank user message.
-scenario_refire_recovers() {
-  NEW_WORK refire-recovers
+# A violating reply is gated, the kernel logs the follow-up and drains
+# it as a new model turn, and the clean revision ends the run: two
+# model turns, two user_messages (the seed plus one gate follow-up),
+# no refire marker.
+scenario_gate_recovers() {
+  NEW_WORK gate-recovers
   work_config ""
   seed_session
   make_stub
   run_loop
-  assert_eq "$(user_message_count)" "1" \
-    "only the seed user_message, no follow appended"
+  assert_eq "$(user_message_count)" "2" \
+    "the seed plus one gate follow-up user_message"
   assert_eq "$(empty_user_message_count)" "0" \
     "no blank user_message in the log"
+  assert_eq "$(gate_message_count)" "1" \
+    "exactly one logged gate follow-up"
   assert_eq "$(wc -l < "$STUB_REQLOG" | tr -d ' ')" "2" \
-    "the seed turn plus one silent refire turn"
-  assert_eq "$(count_markers "run.refire")" "1" \
-    "one refire marker"
+    "the seed turn plus one follow-up turn"
+  assert_eq "$(count_markers "run.refire")" "0" \
+    "the refire mechanism is retired"
   assert_eq "$(count_markers "run.refire_cap")" "0" \
-    "the cap was not reached"
-  # Issue #5: the correction prompt no longer rides the prompt
-  # fragment (instructions head). It is the last user item of the
-  # request input, and the marker text identifies it.
-  if req_tail_is_marker_user_item 2; then
+    "no refire cap marker"
+  # The follow-up request carries the gate text as the last user item
+  # of the input, and the seed request tail must not carry it.
+  if req_tail_has_gate_text 2; then
     ok
   else
-    ko "the refired request tail is the feedback user item"
+    ko "the follow-up request tail is the gate user item"
   fi
-  if req_tail_is_marker_user_item 1; then
-    ko "the seed request tail must not carry the feedback"
+  if req_tail_has_gate_text 1; then
+    ko "the seed request tail must not carry the gate text"
   else
     ok
   fi
-  if req_instructions_carry_marker 1 || req_instructions_carry_marker 2; then
-    ko "instructions must not carry the feedback marker"
+  if req_instructions_carry_gate_text 1 || req_instructions_carry_gate_text 2; then
+    ko "instructions must not carry the gate text"
   else
     ok
   fi
   assert_eq "$(state_field hard)" "0" \
     "the clean revision settles the gate"
-  assert_eq "$(state_field pending_feedback)" "null" \
-    "the feedback was consumed by the refired call"
+  assert_eq "$(state_field gate_count)" "0" \
+    "the clean revision resets the gate counter"
 }
 
-# The gate keeps refiring on a model that never fixes the reply:
-# the per-run cap (default 2) bounds the silent loop, the run stops
-# with a cap marker, and the last pending feedback survives in the
-# state file for delivery on the next model call (issue #4 fallback).
-scenario_cap_fallback() {
-  NEW_WORK cap-fallback
+# The gate keeps logging follow-ups on a model that never fixes the
+# reply: MAX_GATE_COUNT (3) bounds the logged follow-ups, the run
+# stops with the last violating reply standing, and no refire marker
+# is logged.
+scenario_gate_caps() {
+  NEW_WORK gate-caps
   work_config ""
   seed_session
   make_stub_violating
   run_loop
-  assert_eq "$(user_message_count)" "1" \
-    "no user_message appended by refires"
-  assert_eq "$(wc -l < "$STUB_REQLOG" | tr -d ' ')" "3" \
-    "the seed turn plus the two allowed refires"
-  assert_eq "$(count_markers "run.refire")" "2" \
-    "two refire markers under the default cap"
-  assert_eq "$(count_markers "run.refire_cap")" "1" \
-    "the cap marker was logged"
-  # Issue #5: each refired request carries its gate feedback as the
-  # last user item of the input, never in instructions.
-  for n in 2 3; do
-    if req_tail_is_marker_user_item $n; then
-      ok
-    else
-      ko "refired request $n tail is the feedback user item"
-    fi
-    if req_instructions_carry_marker $n; then
-      ko "refired request $n instructions carry the marker"
-    else
-      ok
-    fi
-  done
-  if [[ "$(state_field pending_feedback)" == *"Hard violations"* ]]; then
-    ok
-  else
-    ko "the pending feedback survives for the next model call"
-  fi
+  assert_eq "$(user_message_count)" "4" \
+    "the seed plus three gate follow-ups"
+  assert_eq "$(gate_message_count)" "3" \
+    "three logged gate follow-ups under MAX_GATE_COUNT"
+  assert_eq "$(wc -l < "$STUB_REQLOG" | tr -d ' ')" "4" \
+    "the seed turn plus three follow-up turns"
+  assert_eq "$(count_markers "run.refire")" "0" \
+    "the refire mechanism is retired"
+  assert_eq "$(count_markers "run.refire_cap")" "0" \
+    "no refire cap marker"
+  assert_eq "$(state_field gate_count)" "3" \
+    "the counter stopped at MAX_GATE_COUNT"
 }
 
-scenario_refire_recovers
-scenario_cap_fallback
+scenario_gate_recovers
+scenario_gate_caps
 
 echo
-echo "refire-reply-gate-e2e: $PASS passed, $FAIL failed"
+echo "reply-gate-e2e: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]

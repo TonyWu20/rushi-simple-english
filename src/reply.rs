@@ -28,9 +28,6 @@ pub struct ReplyState {
     /// Soft violation count for the most recent linted reply.
     #[serde(default)]
     pub soft: usize,
-    /// Feedback text to inject on the next `model.before` (consumed once).
-    #[serde(default)]
-    pub pending_feedback: Option<String>,
     /// Identity of the most recently gated reply.
     #[serde(default)]
     pub last_identity: Option<String>,
