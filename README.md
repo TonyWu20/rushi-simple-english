@@ -11,7 +11,7 @@ prose, file edits, and git commit messages.
 | Window         | Behaviour                                                       |
 |----------------|-----------------------------------------------------------------|
 | `tool.before`  | Lints `write`, `edit`, and `bash` (git commit) calls with diff-aware filtering. |
-| `model.before` | Injects the active rule summary and any pending reply-gate feedback into the prompt fragment. |
+| `model.before` | Injects the byte-stable rule summary into `prompt_fragments`. Appends pending reply-gate feedback to the tail of `request.input`. |
 | `run.idle`     | Lints the last assistant reply. Gates the loop on hard violations. |
 
 ## Rules
@@ -77,8 +77,10 @@ On hard violations it emits a silent refire continue
 (`log_message: false` + `refire: true`, kernel issues #4 and #6).
 
 - No user message is logged, so the TUI main view stays clean.
-- The correction prompt rides the `model.before` fragment on the
-  refired call. The model revises the reply within the same run.
+- The correction prompt rides the `model.before` transform on the
+  refired call. It lands as the last user item of `request.input`.
+  The fragment stays byte-stable, so the cached prompt prefix holds.
+  The model revises the reply within the same run.
 - The TUI row widget shows the counts until the reply is clean.
 - The kernel caps silent refires per run (`[run] max_silent_refires`,
   default 2).

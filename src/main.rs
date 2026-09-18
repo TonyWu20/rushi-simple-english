@@ -11,16 +11,20 @@
 //!   violations are logged to stderr.  Write and edit calls use
 //!   diff-aware linting: the previous file content is read from disk,
 //!   and only violations that are *new* to the change are reported.
-//! - **`model.before`** — injects a cache-stable rule summary into
-//!   `request.prompt_fragments`, plus any pending reply-gate
-//!   feedback from the previous `run.idle` evaluation.
+//! - **`model.before`** — injects the byte-stable rule summary into
+//!   `request.prompt_fragments`. Any pending reply-gate feedback
+//!   from the previous `run.idle` evaluation is appended as a user
+//!   item at the tail of `request.input` (issue #5). Dynamic
+//!   content rides the conversation tail. The cached prompt prefix
+//!   survives.
 //! - **`run.idle`** — lints the last assistant reply.  When hard
 //!   violations are found, the loop is continued with a silent
 //!   refire (`log_message: false` + `refire: true`, kernel issues
 //!   #4 and #6): the loop runs a model turn in place and logs no
-//!   user message at all.  The correction prompt is carried to that
-//!   refired call by this hook's `model.before` prompt fragment, so
-//!   the model revises the gated reply within the same run.  The
+//!   user message at all.  The correction prompt rides the
+//!   `model.before` transform as the last user item of
+//!   `request.input` on that refired call. The model revises the
+//!   gated reply within the same run.  The
 //!   kernel bounds the silent loop (`[run] max_silent_refires`,
 //!   default 2); when refire is unsupported or disabled the pending
 //!   feedback simply waits for the next model call.  The lint
@@ -290,53 +294,95 @@ fn handle_tool_before(payload: &serde_json::Value) {
 
 // ── model.before ──────────────────────────────────────────────────────────
 
-/// Inject the rule summary into the model request's prompt fragments.
-/// Also injects the pending reply-gate feedback from the previous
-/// `run.idle` evaluation, when present.
+/// Build the transformed model request (issue #5 placement rule).
 ///
-/// The transform is a pure function of (request, config,
-/// pending-feedback). Consecutive calls with unchanged state produce
-/// byte-identical output, so the prefix cache stays stable.
-fn handle_model_before(payload: &serde_json::Value) {
-    let request = payload.get("request").cloned().unwrap_or(json!({}));
+/// - Stable content: the rule summary alone goes into
+///   `prompt_fragments`. The kernel joins fragments into
+///   `instructions`, the head of the prompt. The fragment text must
+///   stay byte-stable. Any change breaks the cached prefix.
+/// - Dynamic content: the pending reply-gate feedback is appended
+///   as a single user-role item at the tail of `request.input`.
+///   It rides the conversation tail. The cached prefix up to the
+///   last logged message survives. The text carries its own
+///   hook-origin marker, so the model reads it as hook feedback,
+///   not user input.
+///
+/// Returns the transformed request and whether the feedback was
+/// emitted. The caller clears `pending_feedback` only on `true`,
+/// so a skipped emit is retried on the next model call.
+fn model_before_request(
+    request: &serde_json::Value,
+    config: &types::LintConfig,
+    pending_feedback: Option<&str>,
+) -> (serde_json::Value, bool) {
+    let summary = feedback::rule_summary(config);
 
-    let config = config::load_config();
-    let mut summary = feedback::rule_summary(&config);
+    let mut req = request.clone();
 
-    // Inject the pending reply-gate feedback, then clear it so it is
-    // injected exactly once.
-    let session_dir = resolve_session_dir(payload);
-    if let Some(dir) = &session_dir {
-        if let Some(state) = reply::load_state(dir) {
-            if let Some(fb) = &state.pending_feedback {
-                if !fb.is_empty() {
-                    summary.push_str(&format!("\n\n### Pending reply feedback\n\n{fb}"));
-                }
-                let mut cleared = state;
-                cleared.pending_feedback = None;
-                let _ = reply::save_state(dir, &cleared);
-            }
-        }
-    }
-
-    let mut req = request;
+    // Stable fragment: the rule summary alone. Idempotent replace.
     let mut frags: Vec<serde_json::Value> = req
         .get("prompt_fragments")
         .and_then(|f| f.as_array())
         .cloned()
         .unwrap_or_default();
-
     // Remove any existing "simple-english" fragment (idempotent).
     frags.retain(|p| p.get(0).and_then(|i| i.as_str()) != Some("simple-english"));
     // Append our fragment.
     frags.push(json!(["simple-english", summary]));
+    req["prompt_fragments"] = json!(frags);
 
-    if frags.is_empty() {
-        if let Some(obj) = req.as_object_mut() {
-            obj.remove("prompt_fragments");
+    // Dynamic content: the feedback item at the input tail.
+    let mut emitted = false;
+    if let Some(fb) = pending_feedback.filter(|fb| !fb.is_empty()) {
+        match req.get("input") {
+            Some(items) if items.is_array() => {
+                let mut input = items.as_array().unwrap().clone();
+                input.push(json!({ "type": "message", "role": "user", "content": fb }));
+                req["input"] = json!(input);
+                emitted = true;
+            }
+            None => {
+                req["input"] = json!([{ "type": "message", "role": "user", "content": fb }]);
+                emitted = true;
+            }
+            Some(_) => {
+                eprintln!(
+                    "[simple-english] model.before: request.input is not an array. \
+                     Pending feedback not emitted."
+                );
+            }
         }
-    } else {
-        req["prompt_fragments"] = json!(frags);
+    }
+
+    (req, emitted)
+}
+
+/// Transform the model request and clear the consumed feedback.
+///
+/// Load the pending reply-gate feedback and build the transformed
+/// request. Clear the feedback from the state file only when it
+/// was emitted into `request.input`.
+fn handle_model_before(payload: &serde_json::Value) {
+    let request = payload.get("request").cloned().unwrap_or(json!({}));
+    let config = config::load_config();
+    let session_dir = resolve_session_dir(payload);
+
+    let pending = session_dir
+        .as_ref()
+        .and_then(|dir| reply::load_state(dir))
+        .and_then(|state| state.pending_feedback);
+
+    let (req, emitted) = model_before_request(&request, &config, pending.as_deref());
+
+    // Clear-on-inject (unchanged from the fragment path): consume
+    // the feedback only after it was emitted, exactly once.
+    if emitted {
+        if let Some(dir) = &session_dir {
+            if let Some(mut state) = reply::load_state(dir) {
+                state.pending_feedback = None;
+                let _ = reply::save_state(dir, &state);
+            }
+        }
     }
 
     let resp = json!({
@@ -362,8 +408,9 @@ fn handle_model_before(payload: &serde_json::Value) {
 ///   are found. The reply must not have been gated yet. The loop
 ///   runs a model turn in place and logs no user message at all; the
 ///   correction prompt is delivered to that refired call through
-///   this hook's `model.before` prompt fragment, so the model
-///   revises the reply within the same run. The kernel's per-run
+///   this hook's `model.before` transform as the last user item of
+///   `request.input`. The model revises the reply within the same
+///   run. The kernel's per-run
 ///   cap (`[run] max_silent_refires`, default 2) bounds the silent
 ///   loop; when refire is unsupported or disabled the pending
 ///   feedback waits for the next model call instead.
@@ -476,7 +523,8 @@ fn run_idle_decision(
         // and runs a model turn in place, logging no user message at
         // all — not even an empty one. The correction prompt above is
         // picked up by this hook's `model.before` transform on that
-        // refired call, so the model revises the gated reply within
+        // refired call. It lands as the last user item of
+        // `request.input`. The model revises the gated reply within
         // the same run. The kernel's per-run cap (`[run]
         // max_silent_refires`, default 2) bounds the silent loop; when
         // the running kernel lacks the flag or has it disabled, the
@@ -628,7 +676,10 @@ fn print_help() {
     println!(
         "  tool.before  — gates write / edit / bash (git commit) calls"
     );
-    println!("  model.before — injects the writing-rule summary into the prompt");
+    println!(
+        "  model.before — injects the writing-rule summary into the prompt; \
+         appends pending reply feedback to the input tail"
+    );
     println!("  run.idle     — lints the last assistant reply, gates on hard violations");
     println!();
     println!("Input (stdin): {{\"window\":\"<name>\", ...}}");
@@ -846,5 +897,98 @@ mod tests {
         assert_eq!(state.gate_count, 3);
         assert!(state.pending_feedback.is_some(),
             "the stopped chain keeps its feedback for the next model call");
+    }
+
+    /// A `model.before` request whose input ends at an assistant
+    /// message.
+    fn mb_request() -> serde_json::Value {
+        json!({
+            "model": "stub",
+            "instructions": "base",
+            "input": [
+                { "type": "message", "role": "user", "content": "do the task" },
+                { "type": "message", "role": "assistant", "content": "One. Two. Three." }
+            ],
+            "tools": []
+        })
+    }
+
+    #[test]
+    fn model_before_fragment_stays_byte_stable() {
+        // Issue #5: the pending feedback must not ride the fragment.
+        // The fragment holds the stable rule summary only.
+        let config = types::LintConfig::default();
+        let req = mb_request();
+        let fb = "[writing-rules gate, not a user message] fix the reply";
+        let (with, _) = model_before_request(&req, &config, Some(fb));
+        let (without, _) = model_before_request(&req, &config, None);
+        assert_eq!(
+            with["prompt_fragments"],
+            without["prompt_fragments"],
+            "the fragment must not carry the pending feedback"
+        );
+        let frag = with["prompt_fragments"][0].as_array().unwrap();
+        assert_eq!(frag[0], "simple-english");
+        assert!(frag[1].as_str().unwrap().contains("ASD-STE100"));
+        assert!(!frag[1].as_str().unwrap().contains(fb));
+    }
+
+    #[test]
+    fn model_before_feedback_lands_in_input_tail() {
+        // Regression test (issue #5): the input ends at an
+        // assistant message, and the state holds pending feedback.
+        // The transform adds exactly one user item at the tail.
+        // The fragment is unchanged.
+        let config = types::LintConfig::default();
+        let req = mb_request();
+        let fb = "[writing-rules gate, not a user message] fix the reply";
+        let (out, emitted) = model_before_request(&req, &config, Some(fb));
+        assert!(emitted, "the feedback item must be emitted");
+        let input = out["input"].as_array().unwrap();
+        assert_eq!(input.len(), 3, "exactly one extra input item");
+        let last = &input[2];
+        assert_eq!(last["type"], "message");
+        assert_eq!(last["role"], "user");
+        assert_eq!(last["content"], fb);
+        assert_eq!(input[0], req["input"][0], "the user seed is untouched");
+        assert_eq!(
+            input[1],
+            req["input"][1],
+            "the assistant reply is untouched"
+        );
+    }
+
+    #[test]
+    fn model_before_without_feedback_leaves_input_alone() {
+        let config = types::LintConfig::default();
+        let req = mb_request();
+        let (out, emitted) = model_before_request(&req, &config, None);
+        assert!(!emitted, "no feedback, no emit");
+        assert_eq!(out["input"], req["input"]);
+    }
+
+    #[test]
+    fn model_before_handler_clears_consumed_feedback() {
+        // Handler level: when the feedback is emitted, the state
+        // file clears pending_feedback. The counts are preserved.
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = reply::ReplyState::default();
+        state.hard = 2;
+        state.soft = 1;
+        state.pending_feedback =
+            Some("[writing-rules gate, not a user message] fix the reply".into());
+        reply::save_state(dir.path(), &state).unwrap();
+
+        let payload = json!({
+            "window": "model.before",
+            "session": dir.path().to_str().unwrap(),
+            "request": mb_request()
+        });
+        handle_model_before(&payload);
+
+        let after = reply::load_state(dir.path()).unwrap();
+        assert!(after.pending_feedback.is_none(), "clear-on-inject");
+        assert_eq!(after.hard, 2, "the counts are preserved");
+        assert_eq!(after.soft, 1, "the counts are preserved");
     }
 }

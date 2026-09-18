@@ -208,12 +208,15 @@ scenario_refire_recovers() {
     "one refire marker"
   assert_eq "$(count_markers "run.refire_cap")" "0" \
     "the cap was not reached"
-  if req_line_has 2 "Pending reply feedback"; then
+  # Issue #5: the correction prompt no longer rides the prompt
+  # fragment (instructions head). It is the last user item of the
+  # request input, and the marker text identifies it.
+  if req_line_has 2 "[writing-rules gate"; then
     ok
   else
     ko "the refired request carries the correction prompt"
   fi
-  if req_line_has 1 "Pending reply feedback"; then
+  if req_line_has 1 "[writing-rules gate"; then
     ko "the first request must not carry the feedback"
   else
     ok

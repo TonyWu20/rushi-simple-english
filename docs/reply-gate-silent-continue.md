@@ -9,9 +9,11 @@ violation prompt route back to the agent with no user message at all.
 The `run.idle` gate now emits `continue` with `log_message: false`
 and `refire: true`. The kernel runs a model turn in place and logs
 no user message at all. The correction prompt rides the hook's
-`model.before` fragment on that refired call. The model revises the
-gated reply in the same run, so no blank user panel appears in the
-TUI. The row widget carries the status instead.
+`model.before` transform on that refired call. It lands as the last
+user item of `request.input`. The fragment stays byte-stable, so the
+cached prompt prefix holds (issue #5). The model revises the gated
+reply in the same run, so no blank user panel appears in the TUI.
+The row widget carries the status instead.
 
 ## Delivery path
 
@@ -21,8 +23,9 @@ TUI. The row widget carries the status instead.
    It also emits the silent refire continue.
 3. The kernel runs a model turn in place. It logs a `run.refire`
    marker and no `user_message`. The `model.before` transform
-   injects `pending_feedback` into that refired call. It then
-   clears it.
+   appends `pending_feedback` as the last user item of
+   `request.input` on that refired call. It then clears it. The
+   fragment stays byte-stable, so the prompt-cache prefix survives.
 4. The revised reply is linted on the next `run.idle`. A clean
    reply settles the gate and turns the row green. A new violating
    reply gates and refires again.
@@ -51,7 +54,8 @@ TUI. The row widget carries the status instead.
 - `scripts/refire-reply-gate-e2e.sh` runs the real hook against
   `rushi run` with a stub model.
   - `refire-recovers`: the violating reply is gated with one refire
-    marker. The refired request carries the feedback fragment.
+    marker. The refired request carries the feedback as the last
+    user item of `request.input`.
     The clean revision ends the run. The log holds one
     `user_message` (the seed). It holds zero empty ones.
   - `cap-fallback`: a model that never fixes the reply hits the
