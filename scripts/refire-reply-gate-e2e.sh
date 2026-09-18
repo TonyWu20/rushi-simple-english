@@ -161,9 +161,25 @@ count_markers() {
   echo "$n"
 }
 
-req_line_has() {
-  # $1: line number of the reqlog, $2: needle
-  sed -n "$1p" "$STUB_REQLOG" 2>/dev/null | grep -qF "$2"
+req_tail_is_marker_user_item() {
+  # $1: line number of the reqlog. True when the last input item is a
+  # user message carrying the hook-origin marker (issue #5
+  # placement rule).
+  sed -n "$1p" "$STUB_REQLOG" 2>/dev/null | jq -e '
+    (.input | type) == "array"
+    and (.input[-1].type == "message")
+    and (.input[-1].role == "user")
+    and ((.input[-1].content // "") | contains("[writing-rules gate"))
+  ' >/dev/null 2>&1
+}
+
+req_instructions_carry_marker() {
+  # $1: line number of the reqlog. True when instructions carry the
+  # feedback marker. Issue #5 forbids this: the marker must ride the
+  # input tail, not the prompt head.
+  sed -n "$1p" "$STUB_REQLOG" 2>/dev/null | jq -e '
+    (.instructions // "") | contains("[writing-rules gate")
+  ' >/dev/null 2>&1
 }
 
 state_field() {
@@ -211,13 +227,18 @@ scenario_refire_recovers() {
   # Issue #5: the correction prompt no longer rides the prompt
   # fragment (instructions head). It is the last user item of the
   # request input, and the marker text identifies it.
-  if req_line_has 2 "[writing-rules gate"; then
+  if req_tail_is_marker_user_item 2; then
     ok
   else
-    ko "the refired request carries the correction prompt"
+    ko "the refired request tail is the feedback user item"
   fi
-  if req_line_has 1 "[writing-rules gate"; then
-    ko "the first request must not carry the feedback"
+  if req_tail_is_marker_user_item 1; then
+    ko "the seed request tail must not carry the feedback"
+  else
+    ok
+  fi
+  if req_instructions_carry_marker 1 || req_instructions_carry_marker 2; then
+    ko "instructions must not carry the feedback marker"
   else
     ok
   fi
@@ -245,6 +266,20 @@ scenario_cap_fallback() {
     "two refire markers under the default cap"
   assert_eq "$(count_markers "run.refire_cap")" "1" \
     "the cap marker was logged"
+  # Issue #5: each refired request carries its gate feedback as the
+  # last user item of the input, never in instructions.
+  for n in 2 3; do
+    if req_tail_is_marker_user_item $n; then
+      ok
+    else
+      ko "refired request $n tail is the feedback user item"
+    fi
+    if req_instructions_carry_marker $n; then
+      ko "refired request $n instructions carry the marker"
+    else
+      ok
+    fi
+  done
   if [[ "$(state_field pending_feedback)" == *"Hard violations"* ]]; then
     ok
   else
