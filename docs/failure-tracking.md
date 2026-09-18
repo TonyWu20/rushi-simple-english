@@ -141,3 +141,111 @@ Note: that e2e script used the legacy `[paths] tools_root` and
 `extra_tools_roots` keys. The kernel renamed them in commit
 353424a. The script now uses `native_tool_paths` and
 `extension_tool_paths`. The suite runs clean.
+
+## FT-003 — Gate refire: marked feedback still reads as a user echo
+
+**Symptom**
+Session `Rushi-WebUI/sessions/tech-stack-research`.
+The run used the current `rushi-config` flake.
+Kernel rev `46aaaa4`, simple-english rev `547bfb8`, goal-mode rev `75ffc8c`.
+All three were current at run time.
+
+The model posted a survey report ending in open questions.
+The reply gate fired on that report (6 hard violations).
+The silent refire delivered the FT-001 marked feedback.
+The model still read the feedback as a user echo.
+It attributed its own report to the user.
+
+It then fabricated a user instruction that never arrived.
+It executed that instruction and committed the planning layer.
+Commit `b7f4953` on `refactor` is the result.
+The user stopped the loop by hand.
+
+**Evidence** (`~/programming/Rushi-WebUI/sessions/tech-stack-research/events.jsonl`)
+
+- Line 157: `assistant_message`, the survey report.
+  It ends with a "What needs your call" list of 3 open questions.
+- Line 158: `ext_status` id `run.refire`, value `{"n":1}`.
+- Line 164: the refired model call.
+  Its reasoning says the human turn contains the investigation report.
+  It says the user pasted the report back to it.
+- Line 173: the model re-posts the report as a re-verification.
+  This reply is gated too (gated reply #2).
+- Line 174: `ext_status` id `run.refire`, value `{"n":2}`.
+- Line 180: the model invents a user quote.
+  It claims the user answered its own open questions.
+  It then executes without any user input.
+- Line 191: it reports commit `b7f4953` as done.
+- `simple-english-state.json`: `gate_count` 2, two gated replies.
+  `pending_feedback` is cleared.
+
+The whole log holds 3 genuine `user_message` events.
+They are at lines 1, 2, and 521.
+
+**Verified**
+The deployed hook binary contains the FT-001 marker text.
+I checked the packaged binary with `strings`.
+The `flake.lock` pin equals local HEAD `547bfb8`.
+So the run used the fixed hook.
+
+The marker text reached the model.
+It did not stop the misread.
+
+**Root cause**
+The FT-001 fix is text-level only.
+The feedback still rides `request.input` as a `user`-role item.
+That is src/main.rs line 340, the `model.before` transform.
+The role signal outweighs the marker text.
+The local model (Qwen3.8-27B NVFP4 via sglang) reads a
+`user`-role item at the input tail as a user turn.
+
+The report above it ends in open questions.
+The model fills the gap and assumes the user answered them.
+The violation list cites `line N, column M` only.
+It does not quote the flagged text.
+The model re-derives the report content and misattributes it.
+
+**Fix status**
+Patches prepared 2026-09-19. Not applied. Decision pending.
+Each patch applies to a clean `547bfb8` tree with `git apply`.
+
+1. Role change, in this repo (small).
+   Patch: `scratch/ft003-system-role-feedback.patch`.
+   Deliver `pending_feedback` as a `system`-role item.
+   The live sglang endpoint accepts `system` and `developer` items
+   in `input`. Verified with curl on 2026-09-19.
+   The kernel chat-completions fallback passes roles through.
+   Cache impact is none. The item stays at the input tail.
+
+   Touches: `model_before_request` (src/main.rs), the unit test,
+   and the e2e assertion. The e2e helper is renamed to
+   `req_tail_is_marker_system_item`.
+   Verified: `cargo test` passes 117/117 with the patch applied.
+   The refire e2e suite passes 19/19 with the patch applied.
+
+2. Kernel-level feedback channel (larger).
+   Add a `feedback` field to the refire decision payload.
+   The kernel injects it as a non-conversational item.
+   This generalizes the fix.
+
+   Goal-mode continuations share this failure mode (see FT-002).
+   This option needs a kernel change and a flake relock.
+   No patch prepared. Design decision pending.
+
+3. Static fragment note (cheap, complements option 1 or 2).
+   Patch: `scratch/ft003-fragment-protocol-note.patch`.
+   Add a byte-stable "Refire protocol" section to the fragment.
+   It states the refire protocol.
+   It says the follow-up item is hook feedback, not a user message.
+   It says never to answer its own open questions as user replies.
+   Verified: `cargo test` passes 118/118 with the patch applied.
+   Both patches apply together cleanly. Verified on a worktree.
+   The refire e2e suite passes 19/19 with both applied.
+
+**Open item (cross-repo)**
+The FT-002 patch is still unapplied.
+
+`rushi-exts/goal-app/goal-state/src/lib.rs` has no marker.
+The pinned `rushi-goal-mode` rev `75ffc8c` has no marker either.
+Goal continuations are logged `user_message` items.
+They share this failure mode.
