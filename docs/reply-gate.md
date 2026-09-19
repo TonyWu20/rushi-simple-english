@@ -12,16 +12,17 @@ FT-003. Markers and role changes did not hold.
 The gate now emits `continue` with a `message`. The kernel logs that
 message as a `user_message` in the `follow` queue. The next step
 drains it as a new model turn. The model sees a genuine user turn
-asking it to revise the flagged lines. The transcript keeps a normal
-user/assistant alternation.
+asking it to re-send the complete, clean reply. The transcript keeps
+a normal user/assistant alternation.
 
 ## Delivery path
 
 1. `run.idle` lints the last assistant reply.
 2. On hard violations, the hook returns `continue` with a `message`.
    The message lists the hard and soft violations. It tells the
-   model to revise only the flagged lines. It forbids re-posting the
-   reply and answering its own open questions as user replies.
+   model to re-send the complete reply, in full, with every flagged
+   issue fixed, keeping the meaning. It forbids re-verifying the work
+   and answering its own open questions as user replies.
 3. The kernel logs the message as a `user_message` with
    `queue = "follow"`. The next step injects it and runs a model
    turn.
@@ -79,5 +80,10 @@ user/assistant alternation.
 - 2026-09-19: the user retired the silent refire. The kernel
   dropped the `refire` payload flag, the `run.refire` and
   `run.refire_cap` markers, and `[run] max_silent_refires`. The gate
-  switched to a logged follow-up message. The kernel mechanism is
-  gone; this is the only continuation path.
+  switched to a logged follow-up message. That makes the logged
+  follow-up the only continuation path.
+- 2026-09-20: the user found the "revise only the flagged lines"
+  wording frustrating. The run ended on a patch of changed lines.
+  The user could not read a complete clean reply. The gate now asks
+  the model to re-send the whole reply, in full, with the flagged
+  issues fixed. See FT-004.

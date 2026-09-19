@@ -18,8 +18,9 @@
 //! - **`run.idle`** — lints the last assistant reply. When hard
 //!   violations are found, the loop is continued with a logged
 //!   follow-up user message that lists the violations and asks the
-//!   model to revise only the flagged lines. The model revises the
-//!   gated reply within the same run. The hook's `gate_count` is
+//!   model to re-send the complete reply, in full, with every
+//!   flagged issue fixed. The model produces a full clean revision
+//!   within the same run. The hook's `gate_count` is
 //!   bounded by `MAX_GATE_COUNT`, so a model that keeps producing the
 //!   same bad reply stops the chain. The lint result is written to a
 //!   state file that the TUI status widget reads.
@@ -424,9 +425,11 @@ fn run_idle_decision(
         };
         let message = format!(
             "Your last reply had {} hard writing-rule violation(s){soft_note}. \
-             Revise only the flagged lines, keeping the same meaning. \
-             Do not restate, re-verify, or re-post the reply. \
-             Do not answer your own open questions as if the user \
+             Re-send the complete reply, in full, with every flagged issue \
+             below fixed. Do not reply with only the changed lines. \
+             Keep the same meaning and content; change only what the \
+             flagged issues require. Do not re-run, re-verify, or redo the \
+             work. Do not answer your own open questions as if the user \
              replied.\n\n\
              Hard violations:\n{hard_text}{soft_text}",
             hard_count
@@ -696,10 +699,11 @@ mod tests {
     }
 
     #[test]
-    fn run_idle_message_does_not_restate_the_reply() {
+    fn run_idle_message_requests_full_clean_reply() {
         // The logged follow-up must list violations only. It must
-        // not re-inject the reply body, and it must carry the
-        // guard sentences that block the confirmation read.
+        // not re-inject the reply body, but it must ask the model to
+        // re-send the complete clean reply (not just the flagged
+        // lines) so the user ends with a readable version.
         let dir = tempfile::tempdir().unwrap();
         seed_session(dir.path(), "One. Two. Three. Four. Five. Six. Seven.");
         let config = types::LintConfig::default();
@@ -711,10 +715,20 @@ mod tests {
             !message.contains("One. Two. Three. Four. Five. Six. Seven."),
             "the reply body must not be re-injected: {message}"
         );
-        // The model must not restate or re-verify its own reply.
+        // The model must produce the full clean reply, in full, not
+        // just the flagged lines.
         assert!(
-            message.contains("Do not restate, re-verify, or re-post the reply"),
-            "the message must forbid re-posting: {message}"
+            message.contains("Re-send the complete reply, in full"),
+            "the message must request the full clean reply: {message}"
+        );
+        assert!(
+            message.contains("Do not reply with only the changed lines"),
+            "the message must forbid line-only revisions: {message}"
+        );
+        // The model must not re-run or re-verify its own work.
+        assert!(
+            message.contains("Do not re-run, re-verify, or redo the work"),
+            "the message must forbid re-verification: {message}"
         );
         // The model must not answer its own open questions as user
         // replies.

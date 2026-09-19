@@ -75,15 +75,17 @@ content) are linted in full.
 When the loop goes idle, the hook lints the last assistant reply.
 On hard violations it emits a logged follow-up `continue` with a
 `message`. The kernel logs that message as a `user_message` in the
-`follow` queue and drains it as a new model turn. The model revises
-the flagged lines within the same run.
+`follow` queue and drains it as a new model turn. The model re-sends
+the complete clean reply within the same run.
 
 - The follow-up is a genuine `user_message`. The TUI shows it as a
   user panel. That is the accepted cost of retiring the silent
   refire mechanism (FT-003).
 - The message lists the hard and soft violations. It tells the model
-  to revise only the flagged lines, keep the meaning, not re-post
-  the reply, and not answer its own open questions.
+  to re-send the complete reply, in full, with the flagged issues
+  fixed.
+- The model keeps the meaning and content. It must not re-verify the
+  work or answer its own open questions.
 - The `model.before` fragment stays byte-stable. It carries the rule
   summary only, so the cached prompt prefix holds.
 - The TUI row widget shows the counts until the reply is clean.

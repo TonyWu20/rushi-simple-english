@@ -258,3 +258,33 @@ It now flows through the same logged message path as this gate.
 
 If a continuation misread recurs, probe the continuation text
 against the live model first. Record it as a new failure.
+
+## FT-004 — Gate "revise only the flagged lines" left no readable reply
+
+**Symptom**
+Session `rushi/sessions/address-issue-22` (events.jsonl).
+After the gate blocked a long design document, the model's revised
+reply held only the changed lines, like "Revised line 1: ...".
+The user could not read a complete clean reply at the end of the
+run.
+
+**Root cause**
+The gate message read: "Revise only the flagged lines, keeping the
+same meaning. Do not restate, re-verify, or re-post the reply."
+The model followed that literally and posted just the flagged lines.
+That wording existed to stop whole-reply re-posting from FT-002 and
+FT-003. It over-corrected into an unreadable result.
+
+**Fix**
+2026-09-20, by user request. The gate message now asks the model to
+re-send the complete reply, in full, with every flagged issue fixed.
+It keeps the meaning. The guard sentences survive: do not re-run or
+re-verify the work, and do not answer your own open questions as if
+the user replied. A full clean reply is now a deliberate transcript
+cost of the gate. The gate never re-injects the reply, so the
+FT-002 and FT-003 misread path does not apply.
+
+**Verification**
+`cargo test` passes. The test
+`run_idle_message_requests_full_clean_reply` asserts that the
+message requests the full reply and keeps the guard sentences.
