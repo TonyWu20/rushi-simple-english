@@ -60,13 +60,33 @@
           # A subpath builds one crate from the tree. Intra-repo path deps
           # resolve because src keeps the repo layout intact.
           # The output binary name comes from the crate's [[bin]] name.
+          # The version is read from the crate's Cargo.toml so the flake
+          # version tracks the crate instead of going stale.
+          # (First `version = "…"` line is the [package] version.)
+          cargoTOMLVersion = tomlPath:
+            let
+              # builtins.split returns string parts; on newer Nix it may
+              # interleave non-string match items, so keep only strings.
+              lines = builtins.filter (x: builtins.isString x)
+                (builtins.split "\n" (builtins.readFile tomlPath));
+              # First line starting with `version = "…"` is the
+              # [package] version. `version = "` is 11 characters.
+              line = builtins.head
+                (builtins.filter
+                  (l: builtins.substring 0 11 l == "version = \"")
+                  lines);
+              rest = builtins.substring 11 100 line;
+            in
+            # Drop the closing quote.
+            builtins.substring 0 (builtins.stringLength rest - 1) rest;
+
           buildCrate = { crateDir, crateName }:
             let
               crateSrc = if crateDir == "." then self else "${self}/${crateDir}";
             in
             pkgs.rustPlatform.buildRustPackage {
               pname = crateName;
-              version = "0.1.0";
+              version = cargoTOMLVersion "${crateSrc}/Cargo.toml";
               src = crateSrc;
               nativeBuildInputs = [ rustToolchain ];
               cargoLock = { lockFile = "${crateSrc}/Cargo.lock"; };
