@@ -238,13 +238,23 @@ The candidate patches below were superseded and are retired:
    is unnecessary. The guard sentences live in the logged
    follow-up message instead.
 
-**Open item (cross-repo)**
-The FT-002 patch is still unapplied.
+**Open item (cross-repo) — closed 2026-09-19**
+The user judged the FT-002 marker patch unnecessary.
+The goal hook never re-sent the model reply text.
+The re-posting in FT-002 came from the silent refire mechanism.
+A refire ran a model turn with no new user input.
+The model then re-read its own reply in context and re-posted it.
+The goal-app FT-003 record says the same.
 
-`rushi-exts/goal-app/goal-state/src/lib.rs` has no marker.
-The pinned `rushi-goal-mode` rev `75ffc8c` has no marker either.
-Goal continuations are logged `user_message` items.
-They now share the same shape as the gate follow-up.
-A probe of the goal continuation text against the live model is
-the next step before deciding whether it needs the guard sentences
-too.
+Each refire re-sent only the context plus the goal fragment.
+The refire mechanism is now retired from the kernel.
+The fragment note in the FT-002 patch targeted a refire path.
+That path no longer exists. The patch is superseded.
+No goal-app change is needed.
+
+The pinned goal rev already emits a logged message for open goals.
+It emits `{}` for terminal goals. It emits no `refire` key.
+It now flows through the same logged message path as this gate.
+
+If a continuation misread recurs, probe the continuation text
+against the live model first. Record it as a new failure.
