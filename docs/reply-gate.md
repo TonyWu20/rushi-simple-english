@@ -9,27 +9,35 @@ user echo. It invented user confirmations. The gate then gated the
 invented content. Three failures were recorded: FT-001, FT-002, and
 FT-003. Markers and role changes did not hold.
 
-The gate now emits `continue` with a `message`. The kernel logs that
-message as a `user_message` in the `follow` queue. The next step
-drains it as a new model turn. The model sees a genuine user turn
-asking it to re-send the complete, clean reply. The transcript keeps
-a normal user/assistant alternation.
+The gate now appends its own follow-up `user_message` to the session
+log via the `LOG_BIN` binary (the §12 pipeline ABI, issue #6). The
+message rides the `follow` queue. The loop drains it as a new model
+turn. The model sees a genuine user turn asking it to re-send the
+complete, clean reply. The transcript keeps a normal user/assistant
+alternation.
 
 ## Delivery path
 
 1. `run.idle` lints the last assistant reply.
-2. On hard violations, the hook returns `continue` with a `message`.
-   The message lists the hard and soft violations. It tells the
-   model to re-send the complete reply, in full, with every flagged
-   issue fixed, keeping the meaning. It forbids re-verifying the work
-   and answering its own open questions as user replies.
-3. The kernel logs the message as a `user_message` with
-   `queue = "follow"`. The next step injects it and runs a model
-   turn.
-4. The revised reply is linted on the next `run.idle`. A clean
+2. On hard violations (and the gate cap is not reached), the hook
+   appends a `user_message` event to the session log via
+   `"$LOG_BIN" --session "$SESSION"`. The event carries
+   `queue: "follow"`, an RFC 3339 `ts`, and the gate text as
+   `content`. The gate text lists the hard and soft violations and
+   tells the model to re-send the complete reply, in full, with
+   every flagged issue fixed, keeping the meaning. It forbids
+   re-verifying the work and answering its own open questions as
+   user replies.
+3. The hook prints `{}` and exits 0. The loop drains the pending
+   follow-up `user_message` and runs a model turn.
+4. An append failure (e.g. `LOG_BIN` missing) is a step-level
+   failure: the hook exits 3, the kernel logs
+   `hook.run.idle.error`, the window resolves to its default
+   (stop), and the loop never wedges.
+5. The revised reply is linted on the next `run.idle`. A clean
    reply settles the gate and turns the row green. A new violating
    reply gates again, as a new logged follow-up.
-5. The TUI row widget reads the same state file. It shows
+6. The TUI row widget reads the same state file. It shows
    `n hard, m soft` until the reply is clean.
 
 ## What the hook no longer does
@@ -40,7 +48,8 @@ a normal user/assistant alternation.
 - The `model.before` transform injects the byte-stable rule summary
   fragment only. It touches `request.input` not at all. The cached
   prompt prefix survives.
-- It emits no `refire` flag and no `log_message: false`.
+- It emits no `refire` flag, no `log_message: false`, and no §4.3
+  decision envelope.
 
 ## Bounds
 
@@ -53,8 +62,9 @@ a normal user/assistant alternation.
 
 ## Verification
 
-- `cargo test` runs the gate unit tests. They assert a `message`
-  with no `refire` flag on the gate decision. The test
+- `cargo test` runs the gate unit tests. They assert the gate
+  message content and the `Option<String>` return from
+  `run_idle_decision` (some = append, none = clean/capped). The test
   `run_idle_gate_chain_on_new_replies` checks the gate chain. It
   allows three logged follow-ups, then stops at the gate-count
   limit.
@@ -87,3 +97,16 @@ a normal user/assistant alternation.
   The user could not read a complete clean reply. The gate now asks
   the model to re-send the whole reply, in full, with the flagged
   issues fixed. See FT-004.
+- 2026-09-28: §12 pipeline ABI migration (issue #6). The hook now
+  appends its own follow-up `user_message` via `LOG_BIN` instead of
+  emitting a `{"decision":"continue","payload":{"message":...}}`
+  envelope for the kernel to log. Dispatch moved from the payload
+  `window` key to the `HARNESS_WINDOW` env var. `tool.before` emits
+  `{"blocked_calls":[{id,reason}]}` instead of a §4.3 block
+  envelope. `model.before` treats the stdin state as the request
+  object and emits the transformed request directly.
+- 2026-09-28: user decision — the gate's RFC 3339 timestamp is
+  generated with `chrono` (`Utc::now()`, second-precision UTC),
+  superseding the issue's original "pure-std helper, no chrono"
+  requirement. `chrono` is now a dependency of the hook (the kernel
+  already formats its event timestamps with chrono).

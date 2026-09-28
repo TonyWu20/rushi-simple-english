@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-# e2e for the reply-gate logged follow-up: the real
-# harness-hook-simple-english lints the last assistant reply, and on a
-# hard violation returns `continue` with a `message`. The kernel logs
-# that message as a follow `user_message` and drains it as a new model
-# turn. The model revises the reply within the same run. The silent
-# refire mechanism is retired; no `refire` flag, no `run.refire`
-# marker.
+# e2e for the reply-gate logged follow-up (§12 pipeline ABI): the
+# real harness-hook-simple-english lints the last assistant reply,
+# and on a hard violation appends its own follow-up user_message to
+# the session log via the LOG_BIN binary. The loop drains it as a new
+# model turn. The model revises the reply within the same run. The
+# silent refire mechanism is retired; no `refire` flag, no
+# `run.refire` marker.
 
 set -uo pipefail
 
@@ -71,15 +71,14 @@ text = "test"
 [hooks]
 timeout_ms = 30000
 
-[[hooks.on]]
-window  = "model.before"
+[hooks.defs.hook-simple-english]
 command = "$HOOK_BIN"
-args    = []
 
-[[hooks.on]]
-window  = "run.idle"
-command = "$HOOK_BIN"
-args    = []
+[hooks.pipeline."model.before"]
+steps = ["hook-simple-english"]
+
+[hooks.pipeline."run.idle"]
+steps = ["hook-simple-english"]
 ${1:-}
 EOF
 }

@@ -107,20 +107,20 @@ Red when hard > 0, yellow when soft-only, green when clean.
 
 ## Registration
 
-In `config.toml`:
+In `config.toml` (§12 pipeline ABI):
 
 ```toml
-[[hooks.on]]
-window  = "tool.before"
+[hooks.defs.simple-english]
 command = "harness-hook-simple-english"
 
-[[hooks.on]]
-window  = "model.before"
-command = "harness-hook-simple-english"
+[hooks.pipeline."tool.before"]
+steps = ["simple-english"]
 
-[[hooks.on]]
-window  = "run.idle"
-command = "harness-hook-simple-english"
+[hooks.pipeline."model.before"]
+steps = ["simple-english"]
+
+[hooks.pipeline."run.idle"]
+steps = ["simple-english"]
 ```
 
 For the TUI widget, place (or symlink) `simple-english-ext/` under
