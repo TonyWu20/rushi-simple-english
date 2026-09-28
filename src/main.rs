@@ -25,22 +25,32 @@
 //!   same bad reply stops the chain. The lint result is written to a
 //!   state file that the TUI status widget reads.
 //!
-//! ## Protocol
+//! ## Protocol (pipeline ABI, docs/loop-lifecycle-hooks.md §12)
 //!
-//! Input (stdin): one JSON object with at least `{"window":"<name>"}`.
+//! Dispatch: the kernel sets the `HARNESS_WINDOW` env var per pipeline
+//! step, and that is the authoritative window signal. The stdin
+//! payload's `window` key is kept only as a fallback for manual
+//! invocation. `model.before`'s stdin state is the request object
+//! itself (no `window` key), so env dispatch is required there.
 //!
-//! Output (stdout): exactly one JSON object.
-//! - `{}` — no decision; the window default applies.
-//! - `{"decision":"block","payload":{"reason":"...","calls":[...]}}`
-//!   — block the listed tool calls (tool.before only).
-//! - `{"decision":"transform","payload":{"request":{...}}}` — replace
-//!   the model request (model.before only).
-//! - `{"decision":"continue","payload":{"message":"..."}}` — log a
-//!   follow-up user message and continue the loop (run.idle only).
-//!   This is how the writing gate asks the model to revise a gated
-//!   reply.
+//! Per-window state the kernel consumes:
+//! - `tool.before` (stdin state carries the pending `calls`):
+//!   `{"blocked_calls":[{"id","reason"},…]}` or `{}` when nothing is
+//!   blocked. The kernel synthesizes a failed `tool_result` per entry
+//!   and skips routing those calls.
+//! - `model.before` (stdin state *is* the request object): the full
+//!   transformed request object, or `{}` when there is no transform.
+//! - `run.idle`: no stdout state field drives the loop. On a gated
+//!   reply the hook appends its own follow-up `user_message` to the
+//!   session log via the `LOG_BIN` env var (a `queue:"follow"`
+//!   message asking the model to re-send a clean reply); the loop
+//!   drains it as a new turn. A clean reply or a capped gate appends
+//!   nothing. An append failure is a step-level failure (exit 3);
+//!   the window resolves to its default (stop) and the loop never
+//!   wedges.
 //!
-//! Exit codes: 0 = success, 2 = blocking default for the window.
+//! Exit codes: 0 = ok, 2 = abort (veto the window default, sticky),
+//! 3 = fail (the window resolves to its default).
 
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -68,12 +78,23 @@ fn main() {
     }
 
     let payload = read_stdin_json();
-    let window = payload
-        .get("window")
-        .and_then(|w| w.as_str())
-        .unwrap_or("");
+    // The kernel sets HARNESS_WINDOW per pipeline step; that is the
+    // authoritative window signal. The payload `window` key is kept
+    // only as a fallback for manual invocation (model.before's state
+    // is the request object, which has no `window` key, so env
+    // dispatch is required there).
+    let window = std::env::var("HARNESS_WINDOW")
+        .ok()
+        .filter(|w| !w.is_empty())
+        .or_else(|| {
+            payload
+                .get("window")
+                .and_then(|w| w.as_str())
+                .map(|s| s.to_string())
+        })
+        .unwrap_or_default();
 
-    match window {
+    match window.as_str() {
         "tool.before" => handle_tool_before(&payload),
         "model.before" => handle_model_before(&payload),
         "run.idle" => handle_run_idle(&payload),
@@ -92,7 +113,22 @@ fn main() {
 /// content is read from disk, and only violations that are *new* to
 /// the change are reported. This avoids flagging pre-existing issues on
 /// lines the agent did not touch.
+///
+/// Emits `{"blocked_calls":[{"id","reason"},…]}` when one or more
+/// calls are blocked; the kernel skips routing those calls and
+/// synthesizes a failed `tool_result` per entry so the model reads the
+/// reason on its next step. Emits `{}` when nothing is blocked.
 fn handle_tool_before(payload: &serde_json::Value) {
+    let resp = tool_before_state(payload);
+    println!("{resp}");
+}
+
+/// Compute the `tool.before` state for one batch of pending calls.
+/// Pure w.r.t. stdout so it is unit-testable.
+///
+/// Returns `{"blocked_calls":[{"id","reason"},…]}` when one or more
+/// calls are blocked, or `{}` when nothing is blocked.
+fn tool_before_state(payload: &serde_json::Value) -> serde_json::Value {
     let calls = payload
         .get("calls")
         .and_then(|c| c.as_array())
@@ -102,8 +138,9 @@ fn handle_tool_before(payload: &serde_json::Value) {
     let session_dir = resolve_session_dir(payload);
     let config = config::load_config();
 
-    let mut blocked_ids: Vec<String> = Vec::new();
-    let mut reasons: Vec<String> = Vec::new();
+    // §12.5: the kernel reads `blocked_calls` and synthesizes a failed
+    // `tool_result` per entry (bin/rushi/src/step/tool.rs).
+    let mut blocked_calls: Vec<serde_json::Value> = Vec::new();
 
     for call in &calls {
         let name = call.get("name").and_then(|n| n.as_str()).unwrap_or("");
@@ -195,12 +232,12 @@ fn handle_tool_before(payload: &serde_json::Value) {
                 if any_dynamic {
                     // Cannot statically lint dynamic messages; fail
                     // closed.
-                    blocked_ids.push(id.clone());
-                    reasons.push(
-                        "Writing rules could not check the git commit message. \
-                         Use git commit with a static -m or --message argument."
-                            .to_string(),
-                    );
+                    blocked_calls.push(json!({
+                        "id": id,
+                        "reason": "Writing rules could not check the git commit \
+                                   message. Use git commit with a static -m or \
+                                   --message argument."
+                    }));
                     continue;
                 }
                 let hard = all_violations
@@ -258,24 +295,13 @@ fn handle_tool_before(payload: &serde_json::Value) {
             summary_note,
             feedback::format_violations(&path, "", &hard)
         );
-        blocked_ids.push(id);
-        reasons.push(reason);
+        blocked_calls.push(json!({ "id": id, "reason": reason }));
     }
 
-    if blocked_ids.is_empty() {
-        println!("{}", json!({}));
-        return;
+    if blocked_calls.is_empty() {
+        return json!({});
     }
-
-    let combined_reason = reasons.join("\n\n");
-    let resp = json!({
-        "decision": "block",
-        "payload": {
-            "reason": combined_reason,
-            "calls": blocked_ids,
-        }
-    });
-    println!("{resp}");
+    json!({ "blocked_calls": blocked_calls })
 }
 
 // ── model.before ──────────────────────────────────────────────────────────
@@ -312,19 +338,34 @@ fn model_before_request(
 
 /// Transform the model request by injecting the byte-stable rule
 /// summary fragment. No dynamic content rides this transform.
+///
+/// §12.6: the stdin state *is* the request object; the output is the
+/// full transformed request object, or `{}` when the input is not a
+/// request object (the kernel then keeps the original request).
 fn handle_model_before(payload: &serde_json::Value) {
-    let request = payload.get("request").cloned().unwrap_or(json!({}));
-    let config = config::load_config();
-
-    let req = model_before_request(&request, &config);
-
-    let resp = json!({
-        "decision": "transform",
-        "payload": {
-            "request": req,
-        }
-    });
+    let resp = model_before_state(payload);
     println!("{resp}");
+}
+
+/// Compute the `model.before` state for one request object. Pure
+/// w.r.t. stdout so it is unit-testable.
+///
+/// Returns the full transformed request object, or `{}` when the
+/// input is not a request object (the kernel keeps the original
+/// request).
+fn model_before_state(payload: &serde_json::Value) -> serde_json::Value {
+    if !is_request_object(payload) {
+        return json!({});
+    }
+    let config = config::load_config();
+    model_before_request(payload, &config)
+}
+
+/// The model.before state is a request object iff it carries a
+/// non-null `input` (mirrors the kernel's check at
+/// `bin/rushi/src/step/model.rs`).
+fn is_request_object(v: &serde_json::Value) -> bool {
+    v.get("input").map(|i| !i.is_null()).unwrap_or(false)
 }
 
 // ── run.idle ──────────────────────────────────────────────────────────────
@@ -336,11 +377,15 @@ fn handle_model_before(payload: &serde_json::Value) {
 ///   `events.jsonl`.
 /// - Lints the reply text as `ProseFile`.
 /// - Writes the hard/soft counts to a state file for the TUI widget.
-/// - Emits a logged `continue` (`message`) when hard violations are
-///   found and the gate cap is not reached. The kernel logs the
-///   message as a user_message and runs the next model turn. The
-///   model revises the gated reply within the same run.
-/// - Emits `{}` otherwise (the window default is `stop`).
+/// - When hard violations are found and the gate cap is not reached,
+///   appends the correction as a follow-up `user_message` to the
+///   session log via the `LOG_BIN` binary. The loop drains it as a
+///   new model turn, so the model revises the gated reply within the
+///   same run. The transcript keeps a normal user/assistant
+///   alternation.
+/// - Prints `{}` either way; on a clean reply or a capped gate no
+///   message is appended. An append failure is a step-level failure:
+///   the hook exits 3 and the window resolves to its default (stop).
 fn handle_run_idle(payload: &serde_json::Value) {
     let session_dir = match resolve_session_dir(payload) {
         Some(d) => d,
@@ -350,20 +395,36 @@ fn handle_run_idle(payload: &serde_json::Value) {
         }
     };
 
-    let resp = run_idle_decision(&session_dir, &config::load_config());
-    println!("{resp}");
+    match run_idle_decision(&session_dir, &config::load_config()) {
+        Some(message) => {
+            if let Err(e) = append_follow_up_user_message(&session_dir, &message) {
+                eprintln!("[simple-english] {e}");
+                // A failed append is a step-level failure: the window
+                // resolves to its default (stop) and the loop never
+                // wedges.
+                println!("{}", json!({}));
+                std::process::exit(3);
+            }
+        }
+        None => {} // Clean reply or gate cap reached: let the loop stop.
+    }
+    println!("{}", json!({}));
 }
 
 /// Compute the `run.idle` decision for one session and persist the
 /// updated state file. Pure w.r.t. stdout so it is unit-testable.
+///
+/// Returns the follow-up `user_message` content to append on a gated
+/// reply, or `None` when nothing is appended (clean reply, already
+/// gated, or the gate cap is reached).
 fn run_idle_decision(
     session_dir: &Path,
     config: &types::LintConfig,
-) -> serde_json::Value {
+) -> Option<String> {
     // Read the last assistant message with non-empty content.
     let reply_text = match reply::read_last_assistant_message(session_dir) {
         Some(t) => t,
-        None => return json!({}),
+        None => return None,
     };
 
     let report = engine::lint(LintKind::ProseFile, &reply_text, config);
@@ -440,15 +501,11 @@ fn run_idle_decision(
 
         let _ = reply::save_state(session_dir, &state);
 
-        // Logged follow-up: the kernel logs the message as a
-        // user_message and runs the next model turn. The model sees a
-        // normal user turn asking it to revise the gated reply. The
-        // hook's gate_count (bounded by MAX_GATE_COUNT) stops the
-        // chain when the model keeps producing the same bad reply.
-        return json!({
-            "decision": "continue",
-            "payload": { "message": message }
-        });
+        // The hook appends the follow-up user message itself; the loop
+        // drains it as a new turn. The hook's gate_count (bounded by
+        // MAX_GATE_COUNT) stops the chain when the model keeps
+        // producing the same bad reply.
+        return Some(message);
     }
 
     // Clean reply, or the gate cap is reached: allow the stop.
@@ -457,7 +514,107 @@ fn run_idle_decision(
         state.gate_count = 0;
     }
     let _ = reply::save_state(session_dir, &state);
-    json!({})
+    None
+}
+
+/// Append a follow-up `user_message` to the session log through the
+/// kernel's `log` binary, referenced by the `LOG_BIN` env var the
+/// kernel sets for every hook step. The event carries
+/// `queue: "follow"` so the run loop drains it as a new model turn.
+///
+/// The event must be a valid typed event: RFC 3339 `ts` (kernel e2e
+/// `scripts/run-idle-log-message-e2e.sh`) and `content` are the only
+/// non-optional fields beyond the vocabulary tag.
+fn append_follow_up_user_message(session_dir: &Path, content: &str) -> std::io::Result<()> {
+    let log_bin = std::env::var("LOG_BIN").map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "LOG_BIN env var is not set; cannot append the follow-up user message",
+        )
+    })?;
+
+    let mut child = std::process::Command::new(&log_bin)
+        .arg("--session")
+        .arg(session_dir)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::inherit())
+        .spawn()
+        .map_err(|e| {
+            std::io::Error::new(e.kind(), format!("cannot spawn LOG_BIN {log_bin:?}: {e}"))
+        })?;
+
+    {
+        let event = json!({
+            "v": 1,
+            "type": "user_message",
+            "ts": rfc3339_now(),
+            "content": content,
+            "queue": "follow"
+        });
+        let stdin = child
+            .stdin
+            .as_mut()
+            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::Other, "no stdin pipe"))?;
+        use std::io::Write;
+        stdin
+            .write_all(event.to_string().as_bytes())
+            .and_then(|_| stdin.flush())
+            .map_err(|e| {
+                std::io::Error::new(e.kind(), format!("cannot write to LOG_BIN: {e}"))
+            })?;
+        // Dropping `stdin` here closes the write end, so the log
+        // binary sees EOF before it reads.
+    }
+
+    let status = child.wait().map_err(|e| {
+        std::io::Error::new(e.kind(), format!("cannot wait on LOG_BIN: {e}"))
+    })?;
+    if !status.success() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            format!("LOG_BIN exited with {status}"),
+        ));
+    }
+    Ok(())
+}
+
+/// RFC 3339 UTC timestamp at second precision (e.g.
+/// `2025-01-01T00:00:00Z`), computed with std only — the crate has
+/// no chrono dependency.
+fn rfc3339_now() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    rfc3339_from_epoch(secs)
+}
+
+/// Unix-epoch seconds to an RFC 3339 UTC string.
+fn rfc3339_from_epoch(secs: u64) -> String {
+    let days = (secs / 86_400) as i64;
+    let secs_of_day = (secs % 86_400) as u32;
+    let h = secs_of_day / 3600;
+    let m = (secs_of_day % 3600) / 60;
+    let s = secs_of_day % 60;
+    let (y, mo, d) = civil_from_days(days);
+    format!("{y:04}-{mo:02}-{d:02}T{h:02}:{m:02}:{s:02}Z")
+}
+
+/// Howard Hinnant's `civil_from_days`: days since 1970-01-01 to a
+/// proleptic Gregorian calendar date.
+fn civil_from_days(days: i64) -> (i32, u32, u32) {
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097; // [0, 146096]
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365; // [0, 399]
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
+    let mp = (5 * doy + 2) / 153; // [0, 11]
+    let d = doy - (153 * mp + 2) / 5 + 1; // [1, 31]
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = yoe + era * 400 + if m <= 2 { 1 } else { 0 };
+    (y as i32, m as u32, d as u32)
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────
@@ -592,19 +749,20 @@ fn print_help() {
     );
     println!("  run.idle     — lints the last assistant reply, gates on hard violations");
     println!();
-    println!("Input (stdin): {{\"window\":\"<name>\", ...}}");
-    println!("Output (stdout):");
-    println!("  {{}}  — no decision, window default applies");
+    println!("Dispatch: HARNESS_WINDOW env var (set by the kernel); the");
+    println!("stdin payload `window` key is a manual-invocation fallback.");
+    println!();
+    println!("Output (stdout): one JSON state object per window:");
+    println!("  {{}} — no-op; the window default applies");
     println!(
-        "  {{\"decision\":\"block\",\"payload\":{{\"reason\":...,\"calls\":[...]}}}} — block listed calls"
+        "  {{\"blocked_calls\":[{{\"id\":\"...\",\"reason\":\"...\"}}]}} — block the listed tool calls"
     );
+    println!("  <request object> — the transformed model request (model.before)");
+    println!("Exit codes: 0 = ok, 3 = fail (run.idle append failure)");
+    println!();
     println!(
-        "  {{\"decision\":\"transform\",\"payload\":{{\"request\":{{...}}}}}} — replace model request"
+        "run.idle gate effect: appends a follow-up user_message to the session log via LOG_BIN"
     );
-    println!(
-        "  {{\"decision\":\"continue\",\"payload\":{{\"message\":\"...\"}}}} — log follow-up user message, continue loop"
-    );
-    println!("Exit codes: 0 = ok, 2 = blocking default");
     println!();
     println!("Config: .simple-english.json in cwd or $SIMPLE_ENGLISH_CONFIG");
 }
@@ -685,12 +843,7 @@ mod tests {
         seed_session(dir.path(), "One. Two. Three. Four. Five. Six. Seven.");
         let config = types::LintConfig::default();
         let resp = run_idle_decision(dir.path(), &config);
-        assert_eq!(resp["decision"], "continue");
-        // The correction is a logged follow-up user message, not a
-        // silent refire.
-        assert!(resp["payload"].get("log_message").is_none());
-        assert!(resp["payload"].get("refire").is_none());
-        let message = resp["payload"]["message"].as_str().unwrap();
+        let message = resp.as_deref().unwrap();
         assert!(message.contains("Hard violations"), "{message}");
         assert!(message.contains("writing-rule violation"));
         let state = reply::load_state(dir.path()).unwrap();
@@ -707,8 +860,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         seed_session(dir.path(), "One. Two. Three. Four. Five. Six. Seven.");
         let config = types::LintConfig::default();
-        let resp = run_idle_decision(dir.path(), &config);
-        let message = resp["payload"]["message"].as_str().unwrap();
+        let message = run_idle_decision(dir.path(), &config).unwrap();
         // The reply body is not re-shown. Only the violation list
         // points at the flagged locations.
         assert!(
@@ -744,7 +896,7 @@ mod tests {
         seed_session(dir.path(), "The fix is complete.");
         let config = types::LintConfig::default();
         let resp = run_idle_decision(dir.path(), &config);
-        assert_eq!(resp, json!({}));
+        assert!(resp.is_none(), "a clean reply appends nothing");
         let state = reply::load_state(dir.path()).unwrap();
         assert_eq!(state.hard, 0);
         assert_eq!(state.gate_count, 0);
@@ -760,9 +912,9 @@ mod tests {
         seed_session(dir.path(), "One. Two. Three. Four. Five. Six. Seven.");
         let config = types::LintConfig::default();
         let first = run_idle_decision(dir.path(), &config);
-        assert_eq!(first["decision"], "continue");
+        assert!(first.is_some(), "the first firing gates the reply");
         let second = run_idle_decision(dir.path(), &config);
-        assert_eq!(second, json!({}));
+        assert!(second.is_none(), "the re-fire must not re-gate");
         let state = reply::load_state(dir.path()).unwrap();
         assert_eq!(state.gate_count, 1, "the re-fire must not re-gate");
     }
@@ -776,12 +928,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         seed_session(dir.path(), "One. Two. Three. Four. Five. Six. Seven.");
         let config = types::LintConfig::default();
-        let mut decisions = Vec::new();
+        let mut gated = Vec::new();
         let mut n = 1;
         for _ in 0..5 {
             let d = run_idle_decision(dir.path(), &config);
-            decisions.push(d.clone());
-            if d["decision"].as_str() == Some("continue") {
+            gated.push(d.is_some());
+            if d.is_some() {
                 // The continued model turn produces a new reply that
                 // still breaches the paragraph cap.
                 n += 1;
@@ -792,14 +944,7 @@ mod tests {
             }
         }
         // Three gates, then stop at the MAX_GATE_COUNT limit.
-        assert_eq!(decisions.len(), 5);
-        for d in &decisions[..3] {
-            assert_eq!(d["decision"], "continue");
-            assert!(d["payload"]["message"].is_string(), "gate message");
-            assert!(d["payload"].get("refire").is_none(), "no refire flag");
-        }
-        assert_eq!(decisions[3], json!({}));
-        assert_eq!(decisions[4], json!({}));
+        assert_eq!(gated, vec![true, true, true, false, false]);
         let state = reply::load_state(dir.path()).unwrap();
         assert_eq!(state.gate_count, 3);
     }
@@ -851,24 +996,117 @@ mod tests {
 
     #[test]
     fn model_before_handler_transforms_request() {
-        // Handler level: the transform decision wraps the fragment-
-        // injected request. The state file is never read or written
-        // by model.before.
+        // Handler level (§12.6): the stdin state *is* the request
+        // object, and the handler prints the fragment-injected
+        // request. The state file is never read or written by
+        // model.before.
         let dir = tempfile::tempdir().unwrap();
         let mut state = reply::ReplyState::default();
         state.hard = 2;
         state.soft = 1;
         reply::save_state(dir.path(), &state).unwrap();
 
-        let payload = json!({
-            "window": "model.before",
-            "session": dir.path().to_str().unwrap(),
-            "request": mb_request()
-        });
-        handle_model_before(&payload);
+        handle_model_before(&mb_request());
 
         let after = reply::load_state(dir.path()).unwrap();
         assert_eq!(after.hard, 2, "the counts are preserved");
         assert_eq!(after.soft, 1, "the counts are preserved");
+    }
+
+    #[test]
+    fn model_before_state_noop_for_non_request() {
+        // States that are not request objects are no-ops: the handler
+        // emits {} and the kernel keeps the original request.
+        assert_eq!(model_before_state(&json!({})), json!({}));
+        assert_eq!(model_before_state(&json!({ "window": "model.before" })), json!({}));
+        assert_eq!(model_before_state(&json!({ "input": null })), json!({}));
+    }
+
+    #[test]
+    fn tool_before_emits_blocked_calls_state() {
+        // §12.5: blocked calls ride the `blocked_calls` state field as
+        // {id, reason} entries — not the retired §4.3 decision
+        // envelope. The clean call in the batch is not blocked.
+        let dir = tempfile::tempdir().unwrap();
+        let violating = "One. Two. Three. Four. Five. Six. Seven.";
+        let payload = json!({
+            "window": "tool.before",
+            "session": dir.path(),
+            "calls": [
+                {
+                    "id": "w1",
+                    "name": "write",
+                    "arguments": {
+                        "file_path": dir.path().join("notes.md").to_str().unwrap(),
+                        "content": violating
+                    }
+                },
+                {
+                    "id": "w2",
+                    "name": "write",
+                    "arguments": {
+                        "file_path": dir.path().join("clean.md").to_str().unwrap(),
+                        "content": "The fix is complete."
+                    }
+                }
+            ]
+        });
+        let state = tool_before_state(&payload);
+        let blocked = state["blocked_calls"].as_array().expect("blocked_calls array");
+        assert_eq!(blocked.len(), 1, "only the violating call is blocked");
+        assert_eq!(blocked[0]["id"], "w1");
+        assert!(blocked[0]["reason"].as_str().unwrap().contains("Writing rules blocked"));
+        // No §4.3 envelope fields.
+        assert!(state.get("decision").is_none(), "no decision envelope");
+        assert!(state.get("payload").is_none(), "no payload envelope");
+    }
+
+    #[test]
+    fn tool_before_clean_batch_is_noop() {
+        let dir = tempfile::tempdir().unwrap();
+        let payload = json!({
+            "window": "tool.before",
+            "session": dir.path(),
+            "calls": [
+                {
+                    "id": "w1",
+                    "name": "write",
+                    "arguments": {
+                        "file_path": dir.path().join("clean.md").to_str().unwrap(),
+                        "content": "The fix is complete."
+                    }
+                }
+            ]
+        });
+        let state = tool_before_state(&payload);
+        assert_eq!(state, json!({}));
+    }
+
+    #[test]
+    fn rfc3339_timestamps_are_rfc3339() {
+        // Known values (UTC).
+        assert_eq!(rfc3339_from_epoch(0), "1970-01-01T00:00:00Z");
+        assert_eq!(rfc3339_from_epoch(1_700_000_000), "2023-11-14T22:13:20Z");
+        // 2024 is a leap year: Feb 29 exists and Mar 31 follows.
+        assert_eq!(rfc3339_from_epoch(1_709_164_800), "2024-02-29T00:00:00Z");
+        assert_eq!(rfc3339_from_epoch(1_711_843_200), "2024-03-31T00:00:00Z");
+
+        // now() must be second-precision UTC RFC 3339, and agree with
+        // a direct conversion of the same instant within a second.
+        let now = rfc3339_now();
+        assert_eq!(now.len(), 20, "second-precision UTC RFC 3339: {now}");
+        assert!(now.ends_with('Z'), "{now}");
+        assert_eq!(&now[4..5], "-");
+        assert_eq!(&now[7..8], "-");
+        assert_eq!(&now[10..11], "T");
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let secs = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        assert!(
+            now == rfc3339_from_epoch(secs) || now == rfc3339_from_epoch(secs - 1),
+            "now() drifted from the clock: {now}"
+        );
     }
 }
