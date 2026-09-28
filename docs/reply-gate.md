@@ -105,3 +105,8 @@ alternation.
   `{"blocked_calls":[{id,reason}]}` instead of a §4.3 block
   envelope. `model.before` treats the stdin state as the request
   object and emits the transformed request directly.
+- 2026-09-28: user decision — the gate's RFC 3339 timestamp is
+  generated with `chrono` (`Utc::now()`, second-precision UTC),
+  superseding the issue's original "pure-std helper, no chrono"
+  requirement. `chrono` is now a dependency of the hook (the kernel
+  already formats its event timestamps with chrono).
