@@ -55,7 +55,7 @@
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
-use chrono::Utc;
+use chrono::{SecondsFormat, Utc};
 use serde_json::json;
 
 mod commit;
@@ -581,10 +581,12 @@ fn append_follow_up_user_message(session_dir: &Path, content: &str) -> std::io::
 }
 
 /// RFC 3339 UTC timestamp at second precision (e.g.
-/// `2025-01-01T00:00:00Z`), via chrono (the crate's one time
-/// dependency; the kernel formats its event timestamps the same way).
+/// `2025-01-01T00:00:00Z`), via chrono — the exact call the kernel
+/// uses for its event `ts` fields (`Utc::now().to_rfc3339_opts(
+/// SecondsFormat::Secs, true)`), so the hook and kernel timestamps
+/// stay in lockstep.
 fn rfc3339_now() -> String {
-    Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string()
+    Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true)
 }
 
 /// Unix-epoch seconds to an RFC 3339 UTC string (unit-test helper).
@@ -592,8 +594,7 @@ fn rfc3339_now() -> String {
 fn rfc3339_from_epoch(secs: u64) -> String {
     chrono::DateTime::from_timestamp(secs as i64, 0)
         .unwrap()
-        .format("%Y-%m-%dT%H:%M:%SZ")
-        .to_string()
+        .to_rfc3339_opts(SecondsFormat::Secs, true)
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────
