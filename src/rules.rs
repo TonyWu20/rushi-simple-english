@@ -331,6 +331,14 @@ mod tests {
     }
 
     #[test]
+    fn detects_ledger() {
+        let v = check_ste_dictionary(&lines("The ledger entry was updated."), Severity::Hard);
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0].rule_id, "dictionary-not-approved-word");
+        assert_eq!(v[0].suggestions, Some(vec!["log".to_string()]));
+    }
+
+    #[test]
     fn suppression_unknown_rule() {
         let v = check_suppression(
             &lines("// ste-disable-next-line bogus-rule"),
