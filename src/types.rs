@@ -57,6 +57,8 @@ pub enum LintKind {
     SlashSource,
     HashSource,
     CommitMessage,
+    /// No prose is extracted. The content is never linted.
+    Skip,
 }
 
 /// Per-rule setting: severity or off.
