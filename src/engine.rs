@@ -153,6 +153,7 @@ pub(crate) fn extract_prose_lines(kind: LintKind, text: &str) -> Vec<String> {
         }
         LintKind::SlashSource => extract_slash_comments(text),
         LintKind::HashSource => extract_hash_comments(text),
+        LintKind::Skip => Vec::new(),
     }
 }
 
@@ -1087,6 +1088,20 @@ mod tests {
                 .any(|v| v.rule_id == "paragraph-length"),
             "{report:?}"
         );
+    }
+
+    #[test]
+    fn skip_kind_extracts_no_prose() {
+        // The `Skip` kind (legal filenames, skipped data files)
+        // extracts no prose. Text that would trip every rule must
+        // lint clean.
+        let config = LintConfig::default();
+        let text = "One; two. Kick off the build. Obtain, modify, and permit.";
+        let report = lint(LintKind::Skip, text, &config);
+        assert_eq!(report.summary.total, 0, "{report:?}");
+        // The same text as a prose file does trip the rules.
+        let prose = lint(LintKind::ProseFile, text, &config);
+        assert!(prose.summary.hard >= 1, "{prose:?}");
     }
 
     #[test]

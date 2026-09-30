@@ -616,19 +616,33 @@ fn get_display_path(arguments: &serde_json::Value, tool_name: &str) -> String {
 /// Classify a file path into a `LintKind`.
 fn classify_path(path: &str) -> LintKind {
     let lower = path.to_lowercase();
+
+    // Well-known extensionless legal filenames (LICENSE, COPYING, and
+    // the LICENSE.* / COPYING* variants). Canonical license text
+    // cannot be reworded to the STE dictionary, so these skip
+    // linting entirely.
+    let basename = lower.rsplit('/').next().unwrap_or("");
+    if basename == "license"
+        || basename.starts_with("license.")
+        || basename.starts_with("copying")
+    {
+        return LintKind::Skip;
+    }
+
     let ext = lower
         .rsplit('.')
         .next()
         .filter(|s| !s.is_empty())
         .unwrap_or("");
 
-    // Skipped extensions: data files, generated artifacts.
+    // Skipped extensions: data files, generated artifacts. No prose
+    // is extracted, so these lint as a no-op.
     const SKIP: &[&str] = &[
         "css", "scss", "less", "json", "jsonc", "svg", "xml",
         "typ", "csv", "tsv", "lock",
     ];
     if SKIP.contains(&ext) {
-        return LintKind::ProseFile; // treated as prose, effectively a no-op
+        return LintKind::Skip;
     }
 
     match ext {
@@ -636,9 +650,8 @@ fn classify_path(path: &str) -> LintKind {
         "rs" | "go" | "java" | "c" | "h" | "cpp" | "hpp" | "cc"
         | "cs" | "swift" | "kt" | "scala"
         | "ts" | "tsx" | "js" | "jsx" | "mjs" | "cjs" => LintKind::SlashSource,
-        "sh" | "bash" | "zsh" | "py" | "rb" | "yaml" | "yml" | "toml" | "pl" => {
-            LintKind::HashSource
-        }
+        "sh" | "bash" | "zsh" | "py" | "rb" | "yaml" | "yml" | "toml"
+        | "pl" | "nix" => LintKind::HashSource,
         _ => LintKind::ProseFile,
     }
 }
@@ -767,8 +780,23 @@ mod tests {
     }
 
     #[test]
-    fn classify_json_is_prose_skipped() {
-        assert_eq!(classify_path("config.json"), LintKind::ProseFile);
+    fn classify_json_is_skipped() {
+        assert_eq!(classify_path("config.json"), LintKind::Skip);
+    }
+
+    #[test]
+    fn classify_nix_is_hash() {
+        assert_eq!(classify_path("flake.nix"), LintKind::HashSource);
+    }
+
+    #[test]
+    fn classify_license_is_skipped() {
+        // The well-known extensionless legal filenames resolve to the
+        // skip list (no-op), not the catch-all ProseFile.
+        assert_eq!(classify_path("LICENSE"), LintKind::Skip);
+        assert_eq!(classify_path("COPYING"), LintKind::Skip);
+        assert_eq!(classify_path("LICENSE.MIT"), LintKind::Skip);
+        assert_eq!(classify_path("src/COPYING.md"), LintKind::Skip);
     }
 
     #[test]
