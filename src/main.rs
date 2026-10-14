@@ -4,13 +4,24 @@
 //! Ported from jyooi/agent-simple-english (Claude Code plugin + pi
 //! extension) to the rushi harness hook ABI.
 //!
-//! Registered on three harness hook windows:
+//! Registered on four harness hook windows:
 //!
 //! - **`tool.before`** — inspects pending `write`, `edit`, and `bash`
 //!   (git commit) calls.  Hard violations block the call; soft
 //!   violations are logged to stderr.  Write and edit calls use
 //!   diff-aware linting: the previous file content is read from disk,
 //!   and only violations that are *new* to the change are reported.
+//!   For `bash` calls the hook also snapshots the previous content of
+//!   every path token the command mentions. The snapshot lands in a
+//!   sidecar file in the session dir.
+//! - **`tool.after`** — post-checks the files a routed `bash` batch
+//!   changed. It reads the `tool.before` sidecar, re-reads each
+//!   snapshotted file from disk, and lints the files that changed.
+//!   Code files lint comment-only, data files never. A file with
+//!   open hard violations lints in full on its next change, so the
+//!   check runs until the file is clean. There is no gate cap. A
+//!   report splices into the tool result of the call that made the
+//!   change, via a `results` state map.
 //! - **`model.before`** — injects the byte-stable rule summary into
 //!   `request.prompt_fragments`. The fragment is static, so the cached
 //!   prompt prefix survives. Gate feedback no longer rides this
@@ -38,6 +49,10 @@
 //!   `{"blocked_calls":[{"id","reason"},…]}` or `{}` when nothing is
 //!   blocked. The kernel synthesizes a failed `tool_result` per entry
 //!   and skips routing those calls.
+//! - `tool.after` (stdin state carries the routed `calls` and
+//!   `results`): `{"results": {"<id>": <new tool_result>}}` when a
+//!   report splices, or `{}` when nothing is reported. The kernel
+//!   splices each entry into the routed results by call id.
 //! - `model.before` (stdin state *is* the request object): the full
 //!   transformed request object, or `{}` when there is no transform.
 //! - `run.idle`: no stdout state field drives the loop. On a gated
@@ -58,6 +73,7 @@ use std::path::{Path, PathBuf};
 use chrono::{SecondsFormat, Utc};
 use serde_json::json;
 
+mod bash;
 mod commit;
 mod config;
 mod diff;
@@ -97,6 +113,7 @@ fn main() {
 
     match window.as_str() {
         "tool.before" => handle_tool_before(&payload),
+        "tool.after" => handle_tool_after(&payload),
         "model.before" => handle_model_before(&payload),
         "run.idle" => handle_run_idle(&payload),
         _ => {
@@ -142,6 +159,10 @@ fn tool_before_state(payload: &serde_json::Value) -> serde_json::Value {
     // §12.5: the kernel reads `blocked_calls` and synthesizes a failed
     // `tool_result` per entry (bin/rushi/src/step/tool.rs).
     let mut blocked_calls: Vec<serde_json::Value> = Vec::new();
+
+    // Path snapshots for the `tool.after` post-check. One entry per
+    // bash call that mentions lintable files.
+    let mut sidecar_calls: Vec<bash::SnapCall> = Vec::new();
 
     for call in &calls {
         let name = call.get("name").and_then(|n| n.as_str()).unwrap_or("");
@@ -215,6 +236,16 @@ fn tool_before_state(payload: &serde_json::Value) -> serde_json::Value {
                     .get("command")
                     .and_then(|c| c.as_str())
                     .unwrap_or("");
+                // Snapshot the mentioned files for the `tool.after`
+                // post-check. The snapshot happens even when the
+                // commit gate blocks the call. A blocked call is
+                // never routed, so its entry is ignored there.
+                if session_dir.is_some() {
+                    let snap = bash::snapshot_call(&id, command, &session_dir);
+                    if !snap.files.is_empty() {
+                        sidecar_calls.push(snap);
+                    }
+                }
                 let invocations = commit::find_commit_invocations(command);
                 if invocations.is_empty() {
                     continue; // Not a git commit; nothing to lint.
@@ -299,10 +330,134 @@ fn tool_before_state(payload: &serde_json::Value) -> serde_json::Value {
         blocked_calls.push(json!({ "id": id, "reason": reason }));
     }
 
+    if !sidecar_calls.is_empty() {
+        if let Some(dir) = &session_dir {
+            let sidecar = bash::Sidecar {
+                version: 1,
+                calls: sidecar_calls,
+            };
+            if let Err(e) = bash::save_sidecar(dir, &sidecar) {
+                eprintln!("[simple-english] sidecar write failed: {e}");
+            }
+        }
+    }
+
     if blocked_calls.is_empty() {
         return json!({});
     }
     json!({ "blocked_calls": blocked_calls })
+}
+
+// ── tool.after ────────────────────────────────────────────────────────────
+
+/// Post-check the files changed by each bash call in a routed batch.
+///
+/// Reads the sidecar the `tool.before` step wrote for this batch,
+/// lints the changed files, and splices a report into the tool
+/// result of every call whose files carry violations. Emits
+/// `{"results": {"<id>": <new result>}}` when a rewrite is needed,
+/// or `{}` when nothing is reported. The kernel splices each entry
+/// into the routed result by call id. A rewrite that leaves the
+/// original result text intact keeps the command output and the
+/// exit code visible to the model.
+fn handle_tool_after(payload: &serde_json::Value) {
+    let resp = tool_after_state(payload);
+    println!("{resp}");
+}
+
+/// Compute the `tool.after` state for a routed batch. Pure w.r.t.
+/// stdout so it is unit-testable.
+///
+/// Returns `{"results": {"<id>": <new result>}}` for the calls with
+/// a report, or `{}` when nothing is reported.
+fn tool_after_state(payload: &serde_json::Value) -> serde_json::Value {
+    let session_dir = resolve_session_dir(payload);
+    let sidecar = match &session_dir {
+        Some(dir) => bash::load_sidecar(dir),
+        None => None,
+    };
+    let sidecar = match sidecar {
+        Some(s) if !s.calls.is_empty() => s,
+        _ => return json!({}),
+    };
+    let config = config::load_config();
+    let mut open = match &session_dir {
+        Some(dir) => bash::load_open(dir),
+        None => bash::OpenState::default(),
+    };
+
+    let calls = payload
+        .get("calls")
+        .and_then(|c| c.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let results = payload
+        .get("results")
+        .and_then(|r| r.as_array())
+        .cloned()
+        .unwrap_or_default();
+
+    let mut rewrites: Vec<(String, serde_json::Value)> = Vec::new();
+    for (i, call) in calls.iter().enumerate() {
+        let name = call.get("name").and_then(|n| n.as_str()).unwrap_or("");
+        if name != "bash" {
+            continue;
+        }
+        let id = call.get("id").and_then(|i| i.as_str()).unwrap_or("");
+        let snap = sidecar
+            .calls
+            .iter()
+            .find(|s| s.id == id)
+            .cloned()
+            .unwrap_or_else(|| bash::SnapCall {
+                id: id.to_string(),
+                files: Vec::new(),
+            });
+        let Some(report) = bash::check_call(&snap, &mut open, &config) else {
+            continue;
+        };
+        let base = results
+            .iter()
+            .find(|r| r.get("id").and_then(|v| v.as_str()) == Some(id))
+            .cloned()
+            .or_else(|| results.get(i).cloned())
+            .unwrap_or_else(|| json!({}));
+        let mut new_result = base;
+        let old_text = new_result
+            .get("value")
+            .and_then(|v| v.get("text"))
+            .and_then(|t| t.as_str())
+            .unwrap_or("")
+            .to_string();
+        let value = match new_result.get_mut("value") {
+            Some(v) if v.is_object() => {
+                v.as_object_mut()
+                    .unwrap()
+                    .insert(
+                        "text".to_string(),
+                        json!(format!("{old_text}\n\n{report}")),
+                    );
+                    v.clone()
+            }
+            _ => json!({ "text": format!("{old_text}\n\n{report}") }),
+        };
+        new_result["value"] = value;
+        rewrites.push((id.to_string(), new_result));
+    }
+
+    if let Some(dir) = &session_dir {
+        let _ = bash::save_open(dir, &open);
+        bash::clear_sidecar(dir);
+    }
+
+    if rewrites.is_empty() {
+        return json!({});
+    }
+    let mut map = serde_json::Map::new();
+    for (id, v) in rewrites {
+        map.insert(id, v);
+    }
+    json!({ "results": map })
 }
 
 // ── model.before ──────────────────────────────────────────────────────────
@@ -614,7 +769,7 @@ fn get_display_path(arguments: &serde_json::Value, tool_name: &str) -> String {
 }
 
 /// Classify a file path into a `LintKind`.
-fn classify_path(path: &str) -> LintKind {
+pub(crate) fn classify_path(path: &str) -> LintKind {
     let lower = path.to_lowercase();
 
     // Well-known extensionless legal filenames (LICENSE, COPYING, and
@@ -635,11 +790,17 @@ fn classify_path(path: &str) -> LintKind {
         .filter(|s| !s.is_empty())
         .unwrap_or("");
 
-    // Skipped extensions: data files, generated artifacts. No prose
-    // is extracted, so these lint as a no-op.
+    // Skipped extensions: data files, binary artifacts, generated
+    // output. No prose is extracted, so these lint as a no-op.
+    // Binary kinds also protect the post-check: a `.gz` mention in
+    // a bash command never snapshots.
     const SKIP: &[&str] = &[
         "css", "scss", "less", "json", "jsonc", "svg", "xml",
         "typ", "csv", "tsv", "lock",
+        "gz", "zip", "tar", "bz2", "xz", "7z", "rar",
+        "png", "jpg", "jpeg", "gif", "webp", "bmp", "ico", "tiff",
+        "pdf", "bin", "exe", "so", "dylib", "wasm", "o", "a",
+        "class", "jar", "pyc", "db", "sqlite",
     ];
     if SKIP.contains(&ext) {
         return LintKind::Skip;
@@ -703,7 +864,7 @@ fn resolve_previous_content(path: &str, session_dir: &Option<PathBuf>) -> Option
 
 /// Resolve a possibly-relative file path against the session's project
 /// working directory (the `cwd` file inside the session dir).
-fn resolve_file_path(path: &str, session_dir: &Option<PathBuf>) -> PathBuf {
+pub(crate) fn resolve_file_path(path: &str, session_dir: &Option<PathBuf>) -> PathBuf {
     let p = PathBuf::from(path);
     if p.is_absolute() {
         return p;
@@ -738,6 +899,13 @@ fn print_help() {
         "  tool.before  — gates write / edit / bash (git commit) calls"
     );
     println!(
+        "                 and snapshots bash-mentioned files for the post-check"
+    );
+    println!(
+        "  tool.after   — post-checks the changed files, splices reports"
+    );
+    println!("                 into the tool results (a `results` state map)");
+    println!(
         "  model.before — injects the writing-rule summary into the prompt"
     );
     println!("  run.idle     — lints the last assistant reply, gates on hard violations");
@@ -749,6 +917,9 @@ fn print_help() {
     println!("  {{}} — no-op; the window default applies");
     println!(
         "  {{\"blocked_calls\":[{{\"id\":\"...\",\"reason\":\"...\"}}]}} — block the listed tool calls"
+    );
+    println!(
+        "  {{\"results\":{{\"<id\":{{...}}}}}} — splice result rewrites (tool.after)"
     );
     println!("  <request object> — the transformed model request (model.before)");
     println!("Exit codes: 0 = ok, 3 = fail (run.idle append failure)");
@@ -762,6 +933,8 @@ fn print_help() {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+
     use super::*;
 
     #[test]
@@ -787,6 +960,98 @@ mod tests {
     #[test]
     fn classify_nix_is_hash() {
         assert_eq!(classify_path("flake.nix"), LintKind::HashSource);
+    }
+
+    #[test]
+    fn classify_gz_is_skipped() {
+        assert_eq!(classify_path("data.csv.gz"), LintKind::Skip);
+    }
+
+    #[test]
+    fn classify_png_is_skipped() {
+        assert_eq!(classify_path("logo.png"), LintKind::Skip);
+    }
+
+    /// Seed a session dir with a project cwd, one target file, and a
+    /// sidecar that snapshots it.
+    fn seed_after_session(dir: &Path, target: &str, prev: &str) -> PathBuf {
+        let cwd = dir.join("project");
+        fs::create_dir_all(&cwd).unwrap();
+        fs::write(dir.join("cwd"), cwd.to_string_lossy().as_ref()).unwrap();
+        let p = cwd.join(target);
+        fs::write(&p, prev).unwrap();
+        let sidecar = bash::Sidecar {
+            version: 1,
+            calls: vec![bash::SnapCall {
+                id: "c1".to_string(),
+                files: vec![bash::SnapFile {
+                    path: p.to_string_lossy().into_owned(),
+                    prev: Some(prev.to_string()),
+                }],
+            }],
+        };
+        bash::save_sidecar(dir, &sidecar).unwrap();
+        p
+    }
+
+    /// The `tool.after` payload the kernel sends for one routed bash
+    /// call.
+    fn after_payload(dir: &Path, result_text: &str) -> serde_json::Value {
+        json!({
+            "window": "tool.after",
+            "session": dir.to_string_lossy(),
+            "calls": [{
+                "id": "c1",
+                "name": "bash",
+                "arguments": { "command": "echo x > notes.md" }
+            }],
+            "results": [{
+                "id": "c1",
+                "v": 1,
+                "type": "tool_result",
+                "ts": "t",
+                "value": { "text": result_text },
+                "is_error": false
+            }]
+        })
+    }
+
+    #[test]
+    fn tool_after_state_splices_report() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = seed_after_session(dir.path(), "notes.md", "clean start");
+        // Simulate the routed bash call having written a 26-word
+        // sentence (hard violation against the 25-word cap).
+        // 26 words breach the default 25-word cap.
+        let bad = format!("{}.", "lorem ".repeat(26).trim());
+        fs::write(&p, bad).unwrap();
+        let payload = after_payload(dir.path(), "$ echo x > notes.md\n(exit code: 0)");
+        let resp = tool_after_state(&payload);
+        let text = resp["results"]["c1"]["value"]["text"].as_str().unwrap();
+        assert!(text.contains("(exit code: 0)"), "{text}");
+        assert!(text.contains("sentence-length"), "{text}");
+        // The open state recorded the file. The sidecar is consumed.
+        let open = bash::load_open(dir.path());
+        assert!(!open.files.is_empty());
+        assert!(bash::load_sidecar(dir.path()).is_none());
+    }
+
+    #[test]
+    fn tool_after_state_silent_on_unchanged_file() {
+        let dir = tempfile::tempdir().unwrap();
+        seed_after_session(dir.path(), "notes.md", "clean start");
+        let payload = after_payload(dir.path(), "$ ls\n(exit code: 0)");
+        let resp = tool_after_state(&payload);
+        assert_eq!(resp, json!({}));
+    }
+
+    #[test]
+    fn tool_after_state_no_sidecar_is_noop() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("cwd"), "/tmp").unwrap();
+        let payload = after_payload(dir.path(), "$ ls");
+        let resp = tool_after_state(&payload);
+        assert_eq!(resp, json!({}));
     }
 
     #[test]

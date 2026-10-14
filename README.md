@@ -4,13 +4,14 @@ Port of [jyooi/agent-simple-english](https://github.com/jyooi/agent-simple-engli
 to the rushi harness hook ABI.
 
 Enforces ASD-STE100 Simplified Technical English writing rules on agent
-prose, file edits, and git commit messages.
+prose, file edits, bash file writes, and git commit messages.
 
 ## Windows
 
 | Window         | Behaviour                                                       |
 |----------------|-----------------------------------------------------------------|
-| `tool.before`  | Lints `write`, `edit`, and `bash` (git commit) calls with diff-aware filtering. |
+| `tool.before`  | Lints `write`, `edit`, and `bash` (git commit) calls with diff-aware filtering. Snapshots the previous content of every path token a `bash` command mentions. |
+| `tool.after`   | Post-checks the files a `bash` batch changed on disk. Splices a report into the tool result. Runs until a file is clean. |
 | `model.before` | Injects the byte-stable rule summary into `prompt_fragments`. Does not touch `request.input`. |
 | `run.idle`     | Lints the last assistant reply. Gates the loop on hard violations. |
 
@@ -63,6 +64,22 @@ Set `max_paragraph_sentences` to change the paragraph cap.
 Use 0 to turn the rule off.
 Prose kinds default to 6. Source kinds default off.
 
+## Bash write post-check (`tool.after`)
+
+A harness that exposes only the `bash` tool writes files through many
+shell forms. No parser can enumerate them. The hook checks the disk
+instead. `tool.before` snapshots the previous content of every path
+token the command mentions. `tool.after` re-reads the files and lints
+the ones that changed. Code files lint comment-only. Data and binary
+files skip. A file with open hard violations lints in full on its
+next change, until a pass is clean.
+
+The report splices into the tool result of the call that made the
+change. The command output and exit code stay. State lives in
+`<session>/simple-english-sidecar.json` and
+`<session>/simple-english-open.json`. See
+`docs/bash-post-check.md`.
+
 ## Diff-aware linting
 
 `write` and `edit` calls are linted against the previous file content on
@@ -114,6 +131,9 @@ In `config.toml` (§12 pipeline ABI):
 command = "harness-hook-simple-english"
 
 [hooks.pipeline."tool.before"]
+steps = ["simple-english"]
+
+[hooks.pipeline."tool.after"]
 steps = ["simple-english"]
 
 [hooks.pipeline."model.before"]
