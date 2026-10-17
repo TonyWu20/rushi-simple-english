@@ -161,11 +161,13 @@ mod tests {
     #[test]
     fn state_roundtrip() {
         let dir = tempfile::tempdir().unwrap();
-        let mut s = ReplyState::default();
-        s.version = 1;
-        s.hard = 2;
-        s.soft = 1;
-        s.gate_count = 1;
+        let mut s = ReplyState {
+            version: 1,
+            hard: 2,
+            soft: 1,
+            gate_count: 1,
+            ..Default::default()
+        };
         s.record_gated("id-1");
         save_state(dir.path(), &s).unwrap();
 

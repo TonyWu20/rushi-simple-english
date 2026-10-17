@@ -1,8 +1,10 @@
 # rushi-simple-english — ext flake (Mode B, ext-flake-authoring.md §3).
 #
-# Exposes two rushi package artifacts:
+# Exposes three package artifacts:
 #   packages.<system>.hook-simple-english  hook crate  (bare buildRustPackage)
 #   packages.<system>.simple-english-ext  TUI ext crate (wrapAsExt)
+#   packages.<system>.rushi-ste         standalone checker CLI (wrap of the
+#                                        CLI binary in the hook build)
 #
 # $out contracts (ext-flake-authoring.md §2):
 #   hook: $out/bin/harness-hook-simple-english
@@ -93,6 +95,27 @@
               doCheck = false;
             };
 
+          # CLI wrapper: $out/bin/<binName>. The hook build ships both
+          # binaries in $out/bin (buildRustPackage builds every [[bin]]).
+          # This package copies only the standalone checker into a clean
+          # $out, so a consumer can install or run the CLI on its own.
+          wrapAsCli = { binName, built }:
+            pkgs.stdenv.mkDerivation {
+              name = "${binName}-cli";
+              # The installPhase copies from the built crate. src only
+              # satisfies the default unpackPhase.
+              src = self;
+              nativeBuildInputs = [ built ];
+              installPhase = ''
+                mkdir -p $out/bin
+                cp ${built}/bin/${binName} $out/bin/${binName}
+              '';
+              meta = {
+                description = "Standalone ASD-STE100 writing-rule checker";
+                mainProgram = binName;
+              };
+            };
+
           # UI-ext wrapper: $out/<extName>/ext.toml + <extName>/<binDir>/<bin>.
           # binDir must equal the relative command path in ext.toml,
           # because the TUI resolves command against the ext entry dir.
@@ -132,6 +155,10 @@
               rushi = { bin = "harness-hook-simple-english"; };
             };
           };
+          cliPkg = wrapAsCli {
+            binName = "rushi-ste";
+            built = hookBase;
+          };
           extPkg = wrapAsExt {
             # TUI extension: wrap into $out/simple-english/ext.toml +
             # $out/simple-english/target/release/simple-english-ext.
@@ -147,6 +174,7 @@
         in
         {
           "hook-simple-english" = hookPkg;
+          "rushi-ste" = cliPkg;
           "simple-english-ext" = extPkg;
           default = hookPkg;
         }

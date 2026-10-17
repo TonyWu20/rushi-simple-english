@@ -159,3 +159,18 @@ cargo build --release
 ```
 
 The hook binary lands in `target/release/harness-hook-simple-english`.
+
+## Standalone CLI
+
+The `rushi-ste` binary checks text files and stdin against the same
+writing rules the hook enforces. It shares the lint core with the
+hook through the `simple_english` lib target.
+
+    rushi-ste something.md
+    cat something.md | rushi-ste
+
+The report goes to stdout. Errors go to stderr.
+The exit code is 0 when clean and 1 when violations exist.
+Use `--json` for machine-readable output.
+Use `--hard-only` to fail only on hard violations.
+See `docs/cli.md` for the full reference.

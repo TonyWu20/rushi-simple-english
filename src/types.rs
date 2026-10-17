@@ -35,7 +35,6 @@ pub struct Violation {
     pub column: usize,
 }
 
-
 /// Summary of a lint pass.
 #[derive(Debug, Clone, Default)]
 pub struct LintSummary {
@@ -130,4 +129,3 @@ pub struct Paragraph {
     pub line: usize,
     pub column: usize,
 }
-

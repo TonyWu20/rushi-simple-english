@@ -10,14 +10,10 @@
 use crate::types::{Paragraph, Sentence};
 
 /// Known abbreviations that should not trigger a sentence boundary.
-const ABBREVIATIONS: &[&str] = &[
-    "e.g.", "i.e.", "etc.", "vs.", "Fig.", "No.",
-];
+const ABBREVIATIONS: &[&str] = &["e.g.", "i.e.", "etc.", "vs.", "Fig.", "No."];
 
 /// Closing delimiters that can follow a sentence-ending punctuation mark.
-const CLOSING_DELIMS: &[char] = &[
-    '"', '\u{201d}', '\u{00bb}', '\u{203a}', ')', ']', '}',
-];
+const CLOSING_DELIMS: &[char] = &['"', '\u{201d}', '\u{00bb}', '\u{203a}', ')', ']', '}'];
 
 /// Segment `text` into sentences. Each sentence carries its 1-based
 /// line number, 1-based column of its first non-whitespace character,
@@ -109,7 +105,10 @@ pub fn segment_sentences(text: &str, merge_lines: bool) -> Vec<Sentence> {
 
         let rest = &content[last_end..];
         if !rest.trim().is_empty() {
-            open = Some((i, marker_len + last_end + (rest.len() - rest.trim_start().len())));
+            open = Some((
+                i,
+                marker_len + last_end + (rest.len() - rest.trim_start().len()),
+            ));
             parts.push(rest.trim().to_string());
         }
 
@@ -199,9 +198,7 @@ fn sentence_ends(line: &str) -> Vec<(usize, usize)> {
 
                 // Check if this is a known abbreviation (e.g. "e.g.")
                 let before = &line[..start];
-                let is_abbrev = ABBREVIATIONS.iter().any(|abbr| {
-                    before.ends_with(abbr)
-                });
+                let is_abbrev = ABBREVIATIONS.iter().any(|abbr| before.ends_with(abbr));
 
                 if !is_abbrev && !shebang {
                     ends.push((start, end));
@@ -229,10 +226,7 @@ fn sentence_ends(line: &str) -> Vec<(usize, usize)> {
 /// Each returned `Paragraph` carries the 1-based line number of its
 /// first non-blank line and the subset of `sentences` that start on
 /// lines belonging to that paragraph.
-pub fn segment_paragraphs(
-    text: &str,
-    sentences: &[Sentence],
-) -> Vec<Paragraph> {
+pub fn segment_paragraphs(text: &str, sentences: &[Sentence]) -> Vec<Paragraph> {
     let lines: Vec<&str> = text.split('\n').collect();
     if lines.is_empty() {
         return Vec::new();
@@ -327,9 +321,7 @@ fn block_analysis(line: &str) -> (BlockKind, usize) {
     // same `-`, `_`, `*`, or `=`, with optional spaces between.
     let solid: Vec<char> = t.chars().filter(|c| !c.is_whitespace()).collect();
     if solid.len() >= 3
-        && solid
-            .iter()
-            .all(|c| matches!(c, '-' | '_' | '*' | '='))
+        && solid.iter().all(|c| matches!(c, '-' | '_' | '*' | '='))
         && solid.iter().all(|c| c == &solid[0])
     {
         return (BlockKind::ThematicBreak, 0);
@@ -414,10 +406,7 @@ mod tests {
 
     #[test]
     fn multi_line_sentence() {
-        let sents = segment_sentences(
-            "This is a long sentence that\nspans multiple lines.",
-            true,
-        );
+        let sents = segment_sentences("This is a long sentence that\nspans multiple lines.", true);
         assert_eq!(sents.len(), 1);
         assert_eq!(
             sents[0].text,
@@ -519,7 +508,12 @@ mod tests {
         // Each bullet is its own sentence (3), not one merged 21-word sentence.
         assert_eq!(sents.len(), 3);
         for s in &sents {
-            assert!(s.word_count <= 6, "sentence grew too large: {} ({})", s.text, s.word_count);
+            assert!(
+                s.word_count <= 6,
+                "sentence grew too large: {} ({})",
+                s.text,
+                s.word_count
+            );
         }
     }
 
@@ -530,10 +524,15 @@ mod tests {
         let text = "1. First item passes.\n2. Second item passes.\n3. Third item passes.\n4. Fourth item passes.\n5. Fifth item passes.\n6. Sixth item passes.\n7. Seventh item passes.\n";
         let sents = segment_sentences(text, true);
         let paras = segment_paragraphs(text, &sents);
-        assert!(paras.len() >= 7, "each list item should be its own paragraph, got {}", paras.len());
-        assert!(paras
-            .iter()
-            .all(|p| p.sentences.len() <= 6), "no list paragraph exceeds the limit");
+        assert!(
+            paras.len() >= 7,
+            "each list item should be its own paragraph, got {}",
+            paras.len()
+        );
+        assert!(
+            paras.iter().all(|p| p.sentences.len() <= 6),
+            "no list paragraph exceeds the limit"
+        );
     }
 
     #[test]
@@ -544,9 +543,10 @@ mod tests {
         let sents = segment_sentences(text, true);
         let paras = segment_paragraphs(text, &sents);
         assert_eq!(paras.len(), 7);
-        assert!(paras
-            .iter()
-            .all(|p| p.sentences.len() <= 6), "no list paragraph exceeds the limit");
+        assert!(
+            paras.iter().all(|p| p.sentences.len() <= 6),
+            "no list paragraph exceeds the limit"
+        );
     }
 
     #[test]

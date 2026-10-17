@@ -75,15 +75,10 @@ use serde_json::json;
 
 mod bash;
 mod commit;
-mod config;
 mod diff;
-mod dictionaries;
-mod engine;
-mod feedback;
 mod reply;
-mod rules;
-mod sentences;
-mod types;
+
+use simple_english::{classify, config, engine, feedback, types};
 
 use types::{LintKind, Severity};
 
@@ -183,7 +178,7 @@ fn tool_before_state(payload: &serde_json::Value) -> serde_json::Value {
                     .get("content")
                     .and_then(|c| c.as_str())
                     .unwrap_or("");
-                let kind = classify_path(path);
+                let kind = classify::classify_path(path);
                 let prev = resolve_previous_content(path, &session_dir);
                 Some(diff::lint_write(kind, content, prev.as_deref(), &config))
             }
@@ -204,7 +199,7 @@ fn tool_before_state(payload: &serde_json::Value) -> serde_json::Value {
                     .get("replace_all")
                     .and_then(|b| b.as_bool())
                     .unwrap_or(false);
-                let kind = classify_path(path);
+                let kind = classify::classify_path(path);
                 let prev_content = resolve_previous_content(path, &session_dir);
                 match prev_content {
                     None => {
@@ -223,9 +218,7 @@ fn tool_before_state(payload: &serde_json::Value) -> serde_json::Value {
                     ) {
                         Ok(r) => Some(r),
                         Err(e) => {
-                            eprintln!(
-                                "[simple-english] edit lint skipped ({path}): {e}"
-                            );
+                            eprintln!("[simple-english] edit lint skipped ({path}): {e}");
                             continue;
                         }
                     },
@@ -257,8 +250,7 @@ fn tool_before_state(payload: &serde_json::Value) -> serde_json::Value {
                         any_dynamic = true;
                         continue;
                     }
-                    let report =
-                        engine::lint(LintKind::CommitMessage, &inv.message, &config);
+                    let report = engine::lint(LintKind::CommitMessage, &inv.message, &config);
                     all_violations.extend(report.violations);
                 }
                 if any_dynamic {
@@ -433,11 +425,8 @@ fn tool_after_state(payload: &serde_json::Value) -> serde_json::Value {
             Some(v) if v.is_object() => {
                 v.as_object_mut()
                     .unwrap()
-                    .insert(
-                        "text".to_string(),
-                        json!(format!("{old_text}\n\n{report}")),
-                    );
-                    v.clone()
+                    .insert("text".to_string(), json!(format!("{old_text}\n\n{report}")));
+                v.clone()
             }
             _ => json!({ "text": format!("{old_text}\n\n{report}") }),
         };
@@ -551,19 +540,16 @@ fn handle_run_idle(payload: &serde_json::Value) {
         }
     };
 
-    match run_idle_decision(&session_dir, &config::load_config()) {
-        Some(message) => {
-            if let Err(e) = append_follow_up_user_message(&session_dir, &message) {
-                eprintln!("[simple-english] {e}");
-                // A failed append is a step-level failure: the window
-                // resolves to its default (stop) and the loop never
-                // wedges.
-                println!("{}", json!({}));
-                std::process::exit(3);
-            }
+    if let Some(message) = run_idle_decision(&session_dir, &config::load_config()) {
+        if let Err(e) = append_follow_up_user_message(&session_dir, &message) {
+            eprintln!("[simple-english] {e}");
+            // A failed append is a step-level failure: the window
+            // resolves to its default (stop) and the loop never
+            // wedges.
+            println!("{}", json!({}));
+            std::process::exit(3);
         }
-        None => {} // Clean reply or gate cap reached: let the loop stop.
-    }
+    } // Clean reply or gate cap reached: let the loop stop.
     println!("{}", json!({}));
 }
 
@@ -573,15 +559,9 @@ fn handle_run_idle(payload: &serde_json::Value) {
 /// Returns the follow-up `user_message` content to append on a gated
 /// reply, or `None` when nothing is appended (clean reply, already
 /// gated, or the gate cap is reached).
-fn run_idle_decision(
-    session_dir: &Path,
-    config: &types::LintConfig,
-) -> Option<String> {
+fn run_idle_decision(session_dir: &Path, config: &types::LintConfig) -> Option<String> {
     // Read the last assistant message with non-empty content.
-    let reply_text = match reply::read_last_assistant_message(session_dir) {
-        Some(t) => t,
-        None => return None,
-    };
+    let reply_text = reply::read_last_assistant_message(session_dir)?;
 
     let report = engine::lint(LintKind::ProseFile, &reply_text, config);
 
@@ -607,9 +587,7 @@ fn run_idle_decision(
     state.last_identity = Some(identity.clone());
 
     let already_gated = state.has_gated(&identity);
-    let should_gate = hard_count > 0
-        && !already_gated
-        && state.gate_count < reply::MAX_GATE_COUNT;
+    let should_gate = hard_count > 0 && !already_gated && state.gate_count < reply::MAX_GATE_COUNT;
 
     if should_gate {
         let hard_violations: Vec<types::Violation> = report
@@ -711,26 +689,23 @@ fn append_follow_up_user_message(session_dir: &Path, content: &str) -> std::io::
         let stdin = child
             .stdin
             .as_mut()
-            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::Other, "no stdin pipe"))?;
+            .ok_or_else(|| std::io::Error::other("no stdin pipe"))?;
         use std::io::Write;
         stdin
             .write_all(event.to_string().as_bytes())
             .and_then(|_| stdin.flush())
-            .map_err(|e| {
-                std::io::Error::new(e.kind(), format!("cannot write to LOG_BIN: {e}"))
-            })?;
+            .map_err(|e| std::io::Error::new(e.kind(), format!("cannot write to LOG_BIN: {e}")))?;
         // Dropping `stdin` here closes the write end, so the log
         // binary sees EOF before it reads.
     }
 
-    let status = child.wait().map_err(|e| {
-        std::io::Error::new(e.kind(), format!("cannot wait on LOG_BIN: {e}"))
-    })?;
+    let status = child
+        .wait()
+        .map_err(|e| std::io::Error::new(e.kind(), format!("cannot wait on LOG_BIN: {e}")))?;
     if !status.success() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            format!("LOG_BIN exited with {status}"),
-        ));
+        return Err(std::io::Error::other(format!(
+            "LOG_BIN exited with {status}"
+        )));
     }
     Ok(())
 }
@@ -768,55 +743,6 @@ fn get_display_path(arguments: &serde_json::Value, tool_name: &str) -> String {
     }
 }
 
-/// Classify a file path into a `LintKind`.
-pub(crate) fn classify_path(path: &str) -> LintKind {
-    let lower = path.to_lowercase();
-
-    // Well-known extensionless legal filenames (LICENSE, COPYING, and
-    // the LICENSE.* / COPYING* variants). Canonical license text
-    // cannot be reworded to the STE dictionary, so these skip
-    // linting entirely.
-    let basename = lower.rsplit('/').next().unwrap_or("");
-    if basename == "license"
-        || basename.starts_with("license.")
-        || basename.starts_with("copying")
-    {
-        return LintKind::Skip;
-    }
-
-    let ext = lower
-        .rsplit('.')
-        .next()
-        .filter(|s| !s.is_empty())
-        .unwrap_or("");
-
-    // Skipped extensions: data files, binary artifacts, generated
-    // output. No prose is extracted, so these lint as a no-op.
-    // Binary kinds also protect the post-check: a `.gz` mention in
-    // a bash command never snapshots.
-    const SKIP: &[&str] = &[
-        "css", "scss", "less", "json", "jsonc", "svg", "xml",
-        "typ", "csv", "tsv", "lock",
-        "gz", "zip", "tar", "bz2", "xz", "7z", "rar",
-        "png", "jpg", "jpeg", "gif", "webp", "bmp", "ico", "tiff",
-        "pdf", "bin", "exe", "so", "dylib", "wasm", "o", "a",
-        "class", "jar", "pyc", "db", "sqlite",
-    ];
-    if SKIP.contains(&ext) {
-        return LintKind::Skip;
-    }
-
-    match ext {
-        "html" | "htm" => LintKind::ProseFile, // simplified: treat as prose
-        "rs" | "go" | "java" | "c" | "h" | "cpp" | "hpp" | "cc"
-        | "cs" | "swift" | "kt" | "scala"
-        | "ts" | "tsx" | "js" | "jsx" | "mjs" | "cjs" => LintKind::SlashSource,
-        "sh" | "bash" | "zsh" | "py" | "rb" | "yaml" | "yml" | "toml"
-        | "pl" | "nix" => LintKind::HashSource,
-        _ => LintKind::ProseFile,
-    }
-}
-
 /// Resolve the session directory from the payload or the environment.
 ///
 /// The harness passes `session` (the session directory path) in the
@@ -841,8 +767,7 @@ fn resolve_session_dir(payload: &serde_json::Value) -> Option<PathBuf> {
     }
 
     // 2. The SESSION + SESSIONS_ROOT environment variables.
-    if let (Ok(session_name), Ok(root)) =
-        (std::env::var("SESSION"), std::env::var("SESSIONS_ROOT"))
+    if let (Ok(session_name), Ok(root)) = (std::env::var("SESSION"), std::env::var("SESSIONS_ROOT"))
     {
         let p = PathBuf::from(&root).join(&session_name);
         if p.is_dir() {
@@ -895,19 +820,11 @@ fn print_help() {
     println!("harness-hook-simple-english — ASD-STE100 writing-rule hook");
     println!();
     println!("Windows:");
-    println!(
-        "  tool.before  — gates write / edit / bash (git commit) calls"
-    );
-    println!(
-        "                 and snapshots bash-mentioned files for the post-check"
-    );
-    println!(
-        "  tool.after   — post-checks the changed files, splices reports"
-    );
+    println!("  tool.before  — gates write / edit / bash (git commit) calls");
+    println!("                 and snapshots bash-mentioned files for the post-check");
+    println!("  tool.after   — post-checks the changed files, splices reports");
     println!("                 into the tool results (a `results` state map)");
-    println!(
-        "  model.before — injects the writing-rule summary into the prompt"
-    );
+    println!("  model.before — injects the writing-rule summary into the prompt");
     println!("  run.idle     — lints the last assistant reply, gates on hard violations");
     println!();
     println!("Dispatch: HARNESS_WINDOW env var (set by the kernel); the");
@@ -918,9 +835,7 @@ fn print_help() {
     println!(
         "  {{\"blocked_calls\":[{{\"id\":\"...\",\"reason\":\"...\"}}]}} — block the listed tool calls"
     );
-    println!(
-        "  {{\"results\":{{\"<id\":{{...}}}}}} — splice result rewrites (tool.after)"
-    );
+    println!("  {{\"results\":{{\"<id\":{{...}}}}}} — splice result rewrites (tool.after)");
     println!("  <request object> — the transformed model request (model.before)");
     println!("Exit codes: 0 = ok, 3 = fail (run.idle append failure)");
     println!();
@@ -929,6 +844,7 @@ fn print_help() {
     );
     println!();
     println!("Config: .simple-english.json in cwd or $SIMPLE_ENGLISH_CONFIG");
+    println!("Standalone checker: rushi-ste [FILE] - see docs/cli.md");
 }
 
 #[cfg(test)]
@@ -939,37 +855,40 @@ mod tests {
 
     #[test]
     fn classify_md_is_prose() {
-        assert_eq!(classify_path("README.md"), LintKind::ProseFile);
+        assert_eq!(classify::classify_path("README.md"), LintKind::ProseFile);
     }
 
     #[test]
     fn classify_rs_is_slash() {
-        assert_eq!(classify_path("src/main.rs"), LintKind::SlashSource);
+        assert_eq!(
+            classify::classify_path("src/main.rs"),
+            LintKind::SlashSource
+        );
     }
 
     #[test]
     fn classify_py_is_hash() {
-        assert_eq!(classify_path("run.py"), LintKind::HashSource);
+        assert_eq!(classify::classify_path("run.py"), LintKind::HashSource);
     }
 
     #[test]
     fn classify_json_is_skipped() {
-        assert_eq!(classify_path("config.json"), LintKind::Skip);
+        assert_eq!(classify::classify_path("config.json"), LintKind::Skip);
     }
 
     #[test]
     fn classify_nix_is_hash() {
-        assert_eq!(classify_path("flake.nix"), LintKind::HashSource);
+        assert_eq!(classify::classify_path("flake.nix"), LintKind::HashSource);
     }
 
     #[test]
     fn classify_gz_is_skipped() {
-        assert_eq!(classify_path("data.csv.gz"), LintKind::Skip);
+        assert_eq!(classify::classify_path("data.csv.gz"), LintKind::Skip);
     }
 
     #[test]
     fn classify_png_is_skipped() {
-        assert_eq!(classify_path("logo.png"), LintKind::Skip);
+        assert_eq!(classify::classify_path("logo.png"), LintKind::Skip);
     }
 
     /// Seed a session dir with a project cwd, one target file, and a
@@ -1058,15 +977,15 @@ mod tests {
     fn classify_license_is_skipped() {
         // The well-known extensionless legal filenames resolve to the
         // skip list (no-op), not the catch-all ProseFile.
-        assert_eq!(classify_path("LICENSE"), LintKind::Skip);
-        assert_eq!(classify_path("COPYING"), LintKind::Skip);
-        assert_eq!(classify_path("LICENSE.MIT"), LintKind::Skip);
-        assert_eq!(classify_path("src/COPYING.md"), LintKind::Skip);
+        assert_eq!(classify::classify_path("LICENSE"), LintKind::Skip);
+        assert_eq!(classify::classify_path("COPYING"), LintKind::Skip);
+        assert_eq!(classify::classify_path("LICENSE.MIT"), LintKind::Skip);
+        assert_eq!(classify::classify_path("src/COPYING.md"), LintKind::Skip);
     }
 
     #[test]
     fn classify_no_extension() {
-        assert_eq!(classify_path("Makefile"), LintKind::ProseFile);
+        assert_eq!(classify::classify_path("Makefile"), LintKind::ProseFile);
     }
 
     #[test]
@@ -1247,8 +1166,7 @@ mod tests {
         let once = model_before_request(&req, &config);
         let twice = model_before_request(&once, &config);
         assert_eq!(
-            once["prompt_fragments"],
-            twice["prompt_fragments"],
+            once["prompt_fragments"], twice["prompt_fragments"],
             "the fragment must be idempotent and byte-stable"
         );
         let frag = once["prompt_fragments"].as_array().unwrap();
@@ -1274,9 +1192,11 @@ mod tests {
         // request. The state file is never read or written by
         // model.before.
         let dir = tempfile::tempdir().unwrap();
-        let mut state = reply::ReplyState::default();
-        state.hard = 2;
-        state.soft = 1;
+        let state = reply::ReplyState {
+            hard: 2,
+            soft: 1,
+            ..Default::default()
+        };
         reply::save_state(dir.path(), &state).unwrap();
 
         handle_model_before(&mb_request());
@@ -1291,7 +1211,10 @@ mod tests {
         // States that are not request objects are no-ops: the handler
         // emits {} and the kernel keeps the original request.
         assert_eq!(model_before_state(&json!({})), json!({}));
-        assert_eq!(model_before_state(&json!({ "window": "model.before" })), json!({}));
+        assert_eq!(
+            model_before_state(&json!({ "window": "model.before" })),
+            json!({})
+        );
         assert_eq!(model_before_state(&json!({ "input": null })), json!({}));
     }
 
@@ -1325,10 +1248,17 @@ mod tests {
             ]
         });
         let state = tool_before_state(&payload);
-        let blocked = state["blocked_calls"].as_array().expect("blocked_calls array");
+        let blocked = state["blocked_calls"]
+            .as_array()
+            .expect("blocked_calls array");
         assert_eq!(blocked.len(), 1, "only the violating call is blocked");
         assert_eq!(blocked[0]["id"], "w1");
-        assert!(blocked[0]["reason"].as_str().unwrap().contains("Writing rules blocked"));
+        assert!(
+            blocked[0]["reason"]
+                .as_str()
+                .unwrap()
+                .contains("Writing rules blocked")
+        );
         // No §4.3 envelope fields.
         assert!(state.get("decision").is_none(), "no decision envelope");
         assert!(state.get("payload").is_none(), "no payload envelope");

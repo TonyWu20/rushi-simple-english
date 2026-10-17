@@ -28,10 +28,7 @@ pub fn format_violations(
         })
         .collect();
 
-    format!(
-        "{} {}:\n{}",
-        heading, path, details.join("\n")
-    )
+    format!("{} {}:\n{}", heading, path, details.join("\n"))
 }
 
 /// Build the static rule-summary text that is injected into the model
@@ -50,7 +47,10 @@ pub fn rule_summary(config: &LintConfig) -> String {
     // ASD-STE100 group
     let ste_rules: Vec<(&str, Option<String>)> = vec![
         ("contraction", resolved("contraction")),
-        ("dictionary-not-approved-word", resolved("dictionary-not-approved-word")),
+        (
+            "dictionary-not-approved-word",
+            resolved("dictionary-not-approved-word"),
+        ),
         ("paragraph-length", resolved("paragraph-length")),
         ("phrasal-verb", resolved("phrasal-verb")),
         ("semicolon", resolved("semicolon")),
@@ -75,13 +75,12 @@ pub fn rule_summary(config: &LintConfig) -> String {
     }
 
     // Directive validation
-    let directive_lines: Vec<String> = vec![
-        ("invalid-suppression", "Name registered rule IDs in suppression directives."),
-    ]
+    let directive_lines: Vec<String> = vec![(
+        "invalid-suppression",
+        "Name registered rule IDs in suppression directives.",
+    )]
     .into_iter()
-    .filter_map(|(id, summary)| {
-        resolved(id).map(|sev| format!("- [{}] {}", sev, summary))
-    })
+    .filter_map(|(id, summary)| resolved(id).map(|sev| format!("- [{}] {}", sev, summary)))
     .collect();
     if !directive_lines.is_empty() {
         sections.push(format!(
@@ -153,7 +152,10 @@ fn summary_for_rule(id: &str, max_words: usize) -> String {
         "dictionary-not-approved-word" => "Use approved words from the STE dictionary.".to_string(),
         "paragraph-length" => "Use no more than six sentences in one paragraph.".to_string(),
         "phrasal-verb" => "Use an approved single-word verb instead of a phrasal verb.".to_string(),
-        "semicolon" => "Do not use semicolons in prose. Write two sentences. Code fences are exempt.".to_string(),
+        "semicolon" => {
+            "Do not use semicolons in prose. Write two sentences. Code fences are exempt."
+                .to_string()
+        }
         "sentence-length" => format!("Keep each sentence to {} words or fewer.", max_words),
         "verb-progressive" => "Do not use progressive verb forms.".to_string(),
         "verb-passive" => "Prefer active voice.".to_string(),
@@ -194,7 +196,9 @@ mod tests {
     #[test]
     fn rule_summary_respects_off() {
         let mut config = LintConfig::default();
-        config.rules.insert("semicolon".to_string(), "off".to_string());
+        config
+            .rules
+            .insert("semicolon".to_string(), "off".to_string());
         let summary = rule_summary(&config);
         assert!(!summary.contains("[hard] Do not use semicolons"));
     }

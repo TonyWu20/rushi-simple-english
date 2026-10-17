@@ -23,8 +23,7 @@ fn find_phrase(lines: &[String], phrase: &str) -> Vec<(usize, usize)> {
         while let Some(pos) = lower_line[start..].find(&lower_phrase) {
             let abs = start + pos;
             // Check word-boundary on both sides
-            let before_ok = abs == 0
-                || !line[abs - 1..].chars().next().unwrap().is_alphanumeric();
+            let before_ok = abs == 0 || !line[abs - 1..].chars().next().unwrap().is_alphanumeric();
             let after_abs = abs + phrase.len();
             let after_ok = after_abs >= line.len()
                 || !line[after_abs..]
@@ -53,9 +52,7 @@ fn contraction_re() -> &'static Regex {
 
 fn contraction_s_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| {
-        Regex::new(&(r"(?i)".to_string() + CONTRACTION_S_RE)).unwrap()
-    })
+    RE.get_or_init(|| Regex::new(&(r"(?i)".to_string() + CONTRACTION_S_RE)).unwrap())
 }
 
 pub fn check_contractions(lines: &[String], severity: Severity) -> Vec<Violation> {
@@ -134,10 +131,7 @@ fn phrase_violations(
                 out.push(Violation {
                     rule_id,
                     severity,
-                    message: format!(
-                        "Use an approved word instead of \"{}\".",
-                        phrase
-                    ),
+                    message: format!("Use an approved word instead of \"{}\".", phrase),
                     suggestions: Some(vec![sugg]),
                     line: line_no,
                     column: col,
@@ -148,10 +142,7 @@ fn phrase_violations(
     out
 }
 
-pub fn check_phrasal_verbs(
-    lines: &[String],
-    severity: Severity,
-) -> Vec<Violation> {
+pub fn check_phrasal_verbs(lines: &[String], severity: Severity) -> Vec<Violation> {
     phrase_violations(
         lines,
         &dictionaries::phrasal_verbs(),
@@ -168,10 +159,7 @@ pub fn check_marketing(lines: &[String], severity: Severity) -> Vec<Violation> {
     phrase_violations(lines, &dictionaries::marketing(), "marketing", severity)
 }
 
-pub fn check_ste_dictionary(
-    lines: &[String],
-    severity: Severity,
-) -> Vec<Violation> {
+pub fn check_ste_dictionary(lines: &[String], severity: Severity) -> Vec<Violation> {
     phrase_violations(
         lines,
         &dictionaries::ste_dictionary(),
@@ -182,8 +170,32 @@ pub fn check_ste_dictionary(
 
 // ── Suppression directives ─────────────────────────────────────────────────
 
+/// The text after the marker when a line is a `ste-disable-next-line`
+/// directive.
+///
+/// A line is a directive only when the marker is the first thing on
+/// the line. Leading whitespace, one optional comment marker (`//`,
+/// `///`, or `#`), and one optional doc bang (`!`) may precede it.
+/// Prose that merely mentions the marker mid-line never counts. This
+/// keeps doc comments about the feature out of the rule.
+pub fn directive_rest(line: &str) -> Option<&str> {
+    let t = line.trim_start();
+    let t = t
+        .strip_prefix("///")
+        .or_else(|| t.strip_prefix("//"))
+        .or_else(|| t.strip_prefix('#'))
+        .unwrap_or(t);
+    let t = t.trim_start();
+    let t = match t.strip_prefix('!') {
+        Some(rest) => rest.trim_start(),
+        None => t,
+    };
+    t.strip_prefix("ste-disable-next-line")
+}
+
 /// Validate `ste-disable-next-line` directives: every rule ID named in the
-/// directive must be a registered rule.
+/// directive must be a registered rule. A line counts only when the
+/// marker is first on the line (see `directive_rest`).
 pub fn check_suppression(
     lines: &[String],
     registered: &[&str],
@@ -191,14 +203,10 @@ pub fn check_suppression(
 ) -> Vec<Violation> {
     let mut out = Vec::new();
     for (i, line) in lines.iter().enumerate() {
-        if !line.contains("ste-disable-next-line") {
+        let Some(directive) = directive_rest(line) else {
             continue;
-        }
+        };
         // Extract rule IDs from the directive
-        let directive = line
-            .split("ste-disable-next-line")
-            .nth(1)
-            .unwrap_or("");
         let names: Vec<&str> = directive
             .split(|c: char| c.is_whitespace() || c == ',' || c == ':')
             .map(|s| s.trim())
@@ -215,17 +223,13 @@ pub fn check_suppression(
             out.push(Violation {
                 rule_id: "invalid-suppression",
                 severity,
-                message: "Suppression directive must name at least one rule id."
-                    .to_string(),
+                message: "Suppression directive must name at least one rule id.".to_string(),
                 suggestions: None,
                 line: i + 1,
                 column: line.find("ste-disable-next-line").unwrap_or(0) + 1,
             });
         } else if !unknown.is_empty() {
-            let names_str: Vec<String> = unknown
-                .iter()
-                .map(|id| format!("\"{}\"", id))
-                .collect();
+            let names_str: Vec<String> = unknown.iter().map(|id| format!("\"{}\"", id)).collect();
             out.push(Violation {
                 rule_id: "invalid-suppression",
                 severity,
@@ -353,6 +357,40 @@ mod tests {
     fn suppression_valid_rule() {
         let v = check_suppression(
             &lines("// ste-disable-next-line semicolon"),
+            REGISTERED_RULE_IDS,
+            Severity::Hard,
+        );
+        assert!(v.is_empty());
+    }
+
+    #[test]
+    fn directive_rest_requires_marker_first() {
+        assert_eq!(
+            directive_rest("ste-disable-next-line semicolon"),
+            Some(" semicolon")
+        );
+        assert_eq!(
+            directive_rest("// ste-disable-next-line semicolon"),
+            Some(" semicolon")
+        );
+        assert_eq!(
+            directive_rest("# ste-disable-next-line semicolon"),
+            Some(" semicolon")
+        );
+        assert_eq!(
+            directive_rest("! ste-disable-next-line semicolon"),
+            Some(" semicolon")
+        );
+        // A doc line that mentions the marker mid-line is not a
+        // directive.
+        assert_eq!(directive_rest("Parse `ste-disable-next-line` rules."), None);
+        assert_eq!(directive_rest("See ste-disable-next-line in docs."), None);
+    }
+
+    #[test]
+    fn suppression_midline_mention_is_ignored() {
+        let v = check_suppression(
+            &lines("Parse `ste-disable-next-line` directives and return a map."),
             REGISTERED_RULE_IDS,
             Severity::Hard,
         );

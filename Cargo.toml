@@ -27,9 +27,17 @@ categories = ["command-line-utilities", "development-tools", "text-processing"]
 
 [workspace]
 
+[lib]
+name = "simple_english"
+path = "src/lib.rs"
+
 [[bin]]
 name = "harness-hook-simple-english"
 path = "src/main.rs"
+
+[[bin]]
+name = "rushi-ste"
+path = "src/ste.rs"
 
 [dependencies]
 chrono = "0.4"

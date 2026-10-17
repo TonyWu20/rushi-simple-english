@@ -63,7 +63,7 @@ pub fn lint(kind: LintKind, text: &str, config: &LintConfig) -> LintReport {
         let source_kind = matches!(kind, LintKind::SlashSource | LintKind::HashSource);
         let max = config
             .max_paragraph_sentences
-            .unwrap_or_else(|| if source_kind { 0 } else { 6 });
+            .unwrap_or(if source_kind { 0 } else { 6 });
         if max > 0 {
             violations.extend(check_paragraph_length(&paragraphs, max, sev));
         }
@@ -143,8 +143,9 @@ pub fn lint(kind: LintKind, text: &str, config: &LintConfig) -> LintReport {
 /// non-prose structure. Blanked lines keep the line count and byte
 /// layout, so a `Violation.line` still names the source line. Exposed
 /// so `diff` can diff in the same prose coordinate system that the
-/// engine uses for `Violation.line`.
-pub(crate) fn extract_prose_lines(kind: LintKind, text: &str) -> Vec<String> {
+/// engine uses for `Violation.line`. Exposed across crates for the
+/// hook binary's `diff` module.
+pub fn extract_prose_lines(kind: LintKind, text: &str) -> Vec<String> {
     match kind {
         LintKind::ProseFile | LintKind::CommitMessage => {
             let lines: Vec<String> = text.lines().map(String::from).collect();
@@ -249,11 +250,7 @@ fn fence_run(line: &str) -> Option<(char, usize)> {
         return None;
     }
     let run = 1 + chars.take_while(|&c| c == ch).count();
-    if run >= 3 {
-        Some((ch, run))
-    } else {
-        None
-    }
+    if run >= 3 { Some((ch, run)) } else { None }
 }
 
 /// Replace single-line backtick code spans with spaces.
@@ -293,8 +290,8 @@ fn blank_out_inline_spans(line: &str) -> String {
                 close_run += 1;
             }
             if close_run == run && bytes[close.saturating_sub(1)] != b'\\' {
-                for k in open..close + close_run {
-                    out[k] = b' ';
+                for byte in out[open..close + close_run].iter_mut() {
+                    *byte = b' ';
                 }
                 i = close + close_run;
                 break;
@@ -360,9 +357,7 @@ fn is_table_delimiter_row(line: &str) -> bool {
     let trimmed = line.trim();
     !trimmed.is_empty()
         && trimmed.contains('-')
-        && trimmed
-            .chars()
-            .all(|c| matches!(c, '|' | ':' | '-' | ' '))
+        && trimmed.chars().all(|c| matches!(c, '|' | ':' | '-' | ' '))
 }
 
 /// Extract `//` and `/* */` comment text from source code.
@@ -396,14 +391,14 @@ fn extract_slash_comments(text: &str) -> Vec<String> {
             if !trimmed.contains("*/") {
                 in_block = true;
                 // Remove the opening `/*`
-                let after_open = &trimmed[2..];
+                let after_open = trimmed.strip_prefix("/*").unwrap();
                 let body = after_open.trim();
                 if !body.is_empty() {
                     out.push(body.to_string());
                 }
             } else {
                 // Single-line block comment: /* text */
-                let content = &trimmed[2..];
+                let content = trimmed.strip_prefix("/*").unwrap();
                 if let Some(close_pos) = content.find("*/") {
                     let body = content[..close_pos].trim();
                     if !body.is_empty() {
@@ -463,7 +458,7 @@ fn extract_hash_comments(text: &str) -> Vec<String> {
                 // A shebang. Code, not prose.
                 None
             } else if trimmed.starts_with('#') {
-                let comment = &trimmed[1..].trim();
+                let comment = trimmed.strip_prefix('#').unwrap().trim();
                 Some(comment.to_string())
             } else {
                 None
@@ -483,12 +478,12 @@ fn check_sentence_length(
         .iter()
         .filter(|s| s.word_count > max_words)
         .map(|s| {
-            let snippet: String = s
-                .text
-                .chars()
-                .take(60)
-                .collect::<String>()
-                + if s.text.chars().count() > 60 { "..." } else { "" };
+            let snippet: String = s.text.chars().take(60).collect::<String>()
+                + if s.text.chars().count() > 60 {
+                    "..."
+                } else {
+                    ""
+                };
             Violation {
                 rule_id: "sentence-length",
                 severity,
@@ -533,7 +528,9 @@ fn check_paragraph_length(
 }
 
 /// Parse `ste-disable-next-line` directives and return a map of
-/// line-number (1-based) to the set of suppressed rule IDs.
+/// line-number (1-based) to the set of suppressed rule IDs. A line
+/// counts only when the marker is first on the line (see
+/// `rules::directive_rest`).
 fn suppressed_rule_ids_by_line(
     lines: &[String],
 ) -> std::collections::HashMap<usize, std::collections::HashSet<&'static str>> {
@@ -541,13 +538,9 @@ fn suppressed_rule_ids_by_line(
         std::collections::HashMap::new();
 
     for (i, line) in lines.iter().enumerate() {
-        if !line.contains("ste-disable-next-line") {
+        let Some(after_marker) = crate::rules::directive_rest(line) else {
             continue;
-        }
-        let after_marker = line
-            .split_once("ste-disable-next-line")
-            .map(|(_, rest)| rest)
-            .unwrap_or("");
+        };
         let names: Vec<&str> = after_marker
             .split(|c: char| c.is_whitespace() || c == ',' || c == ':')
             .map(|s| s.trim())
@@ -603,10 +596,7 @@ mod tests {
         let config = LintConfig::default();
         let report = lint(LintKind::ProseFile, "One; two.", &config);
         assert!(report.summary.hard >= 1);
-        assert!(report
-            .violations
-            .iter()
-            .any(|v| v.rule_id == "semicolon"));
+        assert!(report.violations.iter().any(|v| v.rule_id == "semicolon"));
     }
 
     #[test]
@@ -614,10 +604,12 @@ mod tests {
         let config = LintConfig::default();
         let long = "This is a sentence that has many words and it definitely exceeds the twenty five word limit that is set by default in the configuration file for this tool";
         let report = lint(LintKind::ProseFile, &format!("{}. ", long), &config);
-        assert!(report
-            .violations
-            .iter()
-            .any(|v| v.rule_id == "sentence-length"));
+        assert!(
+            report
+                .violations
+                .iter()
+                .any(|v| v.rule_id == "sentence-length")
+        );
     }
 
     #[test]
@@ -628,10 +620,12 @@ mod tests {
             "We will kick off the project.",
             &config,
         );
-        assert!(report
-            .violations
-            .iter()
-            .any(|v| v.rule_id == "phrasal-verb"));
+        assert!(
+            report
+                .violations
+                .iter()
+                .any(|v| v.rule_id == "phrasal-verb")
+        );
     }
 
     #[test]
@@ -641,22 +635,14 @@ mod tests {
             .rules
             .insert("semicolon".to_string(), "off".to_string());
         let report = lint(LintKind::ProseFile, "One; two.", &config);
-        assert!(
-            !report
-                .violations
-                .iter()
-                .any(|v| v.rule_id == "semicolon")
-        );
+        assert!(!report.violations.iter().any(|v| v.rule_id == "semicolon"));
     }
 
     #[test]
     fn lint_commit_message_kind() {
         let config = LintConfig::default();
         let report = lint(LintKind::CommitMessage, "fix; update thing", &config);
-        assert!(report
-            .violations
-            .iter()
-            .any(|v| v.rule_id == "semicolon"));
+        assert!(report.violations.iter().any(|v| v.rule_id == "semicolon"));
     }
 
     #[test]
@@ -770,10 +756,7 @@ mod tests {
         let text = "Intro.\n```python\nx = 1;\ny = 2;\n";
         let report = lint(LintKind::ProseFile, text, &config);
         assert!(
-            !report
-                .violations
-                .iter()
-                .any(|v| v.rule_id == "semicolon"),
+            !report.violations.iter().any(|v| v.rule_id == "semicolon"),
             "{report:?}"
         );
     }
@@ -845,10 +828,7 @@ mod tests {
         let text = "Intro.\n<!--\nmulti line comment with; semicolons inside\n-->\nOutro.\n";
         let report = lint(LintKind::ProseFile, text, &config);
         assert!(
-            !report
-                .violations
-                .iter()
-                .any(|v| v.rule_id == "semicolon"),
+            !report.violations.iter().any(|v| v.rule_id == "semicolon"),
             "{report:?}"
         );
     }
@@ -858,7 +838,8 @@ mod tests {
         // Pipe rows inside a fenced code block are code, not a table:
         // the fence blanking already removed them, so no rule fires.
         let config = LintConfig::default();
-        let text = "```md\n| a | b c d e f g h i j k l m n o p q r |\n|---|---|\n```\n\nOne; two.\n";
+        let text =
+            "```md\n| a | b c d e f g h i j k l m n o p q r |\n|---|---|\n```\n\nOne; two.\n";
         let report = lint(LintKind::ProseFile, text, &config);
         let semi: Vec<_> = report
             .violations
@@ -1007,7 +988,11 @@ mod tests {
     #[test]
     fn commit_body_with_dotted_identifier_passes() {
         let config = LintConfig::default();
-        let report = lint(LintKind::CommitMessage, "Fix the run.idle continue path", &config);
+        let report = lint(
+            LintKind::CommitMessage,
+            "Fix the run.idle continue path",
+            &config,
+        );
         assert_eq!(report.summary.total, 0, "{report:?}");
     }
 
@@ -1043,7 +1028,9 @@ mod tests {
         // its own sentence.
         let config = LintConfig::default();
         let lines: Vec<String> = (0..3)
-            .map(|i| format!("# one two three four five six seven eight nine ten eleven twelve {i}"))
+            .map(|i| {
+                format!("# one two three four five six seven eight nine ten eleven twelve {i}")
+            })
             .collect();
         let text = lines.join("\n");
         let report = lint(LintKind::HashSource, &text, &config);

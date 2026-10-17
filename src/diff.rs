@@ -100,11 +100,7 @@ pub fn apply_edit(
 /// An `Insert` or `Replace` op marks its new-side line range as changed;
 /// an `Equal` op leaves its lines untouched. `Delete` ops touch only the
 /// old side.
-fn changed_prose_lines(
-    kind: LintKind,
-    old: &str,
-    new: &str,
-) -> std::collections::HashSet<usize> {
+fn changed_prose_lines(kind: LintKind, old: &str, new: &str) -> std::collections::HashSet<usize> {
     let old_prose = engine::extract_prose_lines(kind, old).join("\n");
     let new_prose = engine::extract_prose_lines(kind, new).join("\n");
     let diff = TextDiff::from_lines(&old_prose, &new_prose);
@@ -213,10 +209,7 @@ mod tests {
             "new phrasal verb on a changed prose line was dropped: {report:?}"
         );
         assert!(
-            !report
-                .violations
-                .iter()
-                .any(|v| v.rule_id == "semicolon"),
+            !report.violations.iter().any(|v| v.rule_id == "semicolon"),
             "semicolon in a source comment must not fire: {report:?}"
         );
     }
@@ -250,9 +243,15 @@ mod tests {
         // only touches line 2, so the old violation must not resurface.
         let config = LintConfig::default();
         let file = "bad; old line\nplain line\n";
-        let report =
-            lint_edit(LintKind::ProseFile, file, "plain line", "plain; new line", false, &config)
-                .unwrap();
+        let report = lint_edit(
+            LintKind::ProseFile,
+            file,
+            "plain line",
+            "plain; new line",
+            false,
+            &config,
+        )
+        .unwrap();
         let lines: Vec<usize> = report.violations.iter().map(|v| v.line).collect();
         assert!(
             lines.iter().all(|l| *l == 2),
@@ -264,17 +263,29 @@ mod tests {
     fn lint_edit_reports_new_violation() {
         let config = LintConfig::default();
         let file = "good line\n";
-        let report =
-            lint_edit(LintKind::ProseFile, file, "good line", "bad; line", false, &config)
-                .unwrap();
+        let report = lint_edit(
+            LintKind::ProseFile,
+            file,
+            "good line",
+            "bad; line",
+            false,
+            &config,
+        )
+        .unwrap();
         assert!(report.summary.hard >= 1);
     }
 
     #[test]
     fn lint_edit_missing_old_is_error() {
         let config = LintConfig::default();
-        let res =
-            lint_edit(LintKind::ProseFile, "a\n", "not-there", "x; y", false, &config);
+        let res = lint_edit(
+            LintKind::ProseFile,
+            "a\n",
+            "not-there",
+            "x; y",
+            false,
+            &config,
+        );
         assert!(res.is_err());
     }
 
@@ -307,9 +318,15 @@ mod tests {
     fn lint_edit_inside_fence_is_exempt() {
         let config = LintConfig::default();
         let file = "Title.\n\n```sh\nrun a\n```\n";
-        let report =
-            lint_edit(LintKind::ProseFile, file, "run a", "run a; run b", false, &config)
-                .unwrap();
+        let report = lint_edit(
+            LintKind::ProseFile,
+            file,
+            "run a",
+            "run a; run b",
+            false,
+            &config,
+        )
+        .unwrap();
         assert_eq!(report.summary.total, 0, "{report:?}");
     }
 

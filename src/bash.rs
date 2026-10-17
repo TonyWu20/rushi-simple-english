@@ -126,9 +126,7 @@ pub fn save_open(dir: &Path, state: &OpenState) -> std::io::Result<()> {
 /// the degenerate token `.md`; the disk check makes it harmless.
 fn path_token_re() -> &'static Regex {
     static RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
-    RE.get_or_init(|| {
-        Regex::new(r"[A-Za-z0-9._/~-]*\.[A-Za-z]{2,6}").expect("static pattern")
-    })
+    RE.get_or_init(|| Regex::new(r"[A-Za-z0-9._/~-]*\.[A-Za-z]{2,6}").expect("static pattern"))
 }
 
 /// Find path-like tokens in a bash command string.
@@ -167,15 +165,11 @@ pub fn resolve_mention(token: &str, session_dir: &Option<PathBuf>) -> PathBuf {
 /// the skip kind and files over `MAX_FILE_BYTES` are dropped. A
 /// missing file snapshots with `prev: None` (a new file lints in
 /// full at `tool.after`).
-pub fn snapshot_call(
-    call_id: &str,
-    command: &str,
-    session_dir: &Option<PathBuf>,
-) -> SnapCall {
+pub fn snapshot_call(call_id: &str, command: &str, session_dir: &Option<PathBuf>) -> SnapCall {
     let mut files: Vec<SnapFile> = Vec::new();
     for token in find_path_mentions(command) {
         let abs = resolve_mention(&token, session_dir);
-        let kind = crate::classify_path(&abs.to_string_lossy());
+        let kind = crate::classify::classify_path(&abs.to_string_lossy());
         if kind == LintKind::Skip {
             continue;
         }
@@ -216,11 +210,7 @@ pub fn snapshot_call(
 /// changed files lint diff-aware against their snapshot. Returns
 /// the report text to splice into the tool result, or `None`.
 /// Updates `open` for every checked file.
-pub fn check_call(
-    call: &SnapCall,
-    open: &mut OpenState,
-    config: &LintConfig,
-) -> Option<String> {
+pub fn check_call(call: &SnapCall, open: &mut OpenState, config: &LintConfig) -> Option<String> {
     let mut hard_sections: Vec<String> = Vec::new();
     let mut soft_sections: Vec<String> = Vec::new();
 
@@ -250,13 +240,10 @@ pub fn check_call(
         }
         // Binary content is not prose.
         if cur.contains('\0') {
-            eprintln!(
-                "[simple-english] post-check skipped (binary): {}",
-                f.path
-            );
+            eprintln!("[simple-english] post-check skipped (binary): {}", f.path);
             continue;
         }
-        let kind = crate::classify_path(&f.path);
+        let kind = crate::classify::classify_path(&f.path);
         if kind == LintKind::Skip {
             continue;
         }
@@ -303,9 +290,7 @@ pub fn check_call(
         return None;
     }
 
-    let mut text = String::from(
-        "[simple-english] Post-check of files changed by this command.\n",
-    );
+    let mut text = String::from("[simple-english] Post-check of files changed by this command.\n");
     for s in &hard_sections {
         text.push_str(s);
         text.push('\n');
@@ -442,7 +427,11 @@ mod tests {
         let session = Some(dir.path().to_path_buf());
         let snap = snapshot_call("c1", &cmd, &session);
         // The json file is the skip kind: not snapshotted.
-        let md = snap.files.iter().find(|f| f.path.ends_with("notes.md")).unwrap();
+        let md = snap
+            .files
+            .iter()
+            .find(|f| f.path.ends_with("notes.md"))
+            .unwrap();
         assert_eq!(md.prev.as_deref(), Some("old text"));
         assert!(!snap.files.iter().any(|f| f.path.ends_with("x.json")));
     }
@@ -469,7 +458,7 @@ mod tests {
     #[test]
     fn check_call_unchanged_file_is_silent() {
         let dir = tempfile::tempdir().unwrap();
-        let p = seed(dir.path(), "notes.md", "clean");
+        seed(dir.path(), "notes.md", "clean");
         let session = Some(dir.path().to_path_buf());
         let snap = snapshot_call("c1", "ls", &session);
         assert!(snap.files.is_empty());
