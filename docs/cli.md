@@ -74,7 +74,7 @@ A clean file prints one line: `something.md: clean`.
 ## Config
 
 The CLI reuses the hook config lookup.
-It reads `.simple-english.json` in the current working directory.
+It reads `.simple-english.toml` in the current working directory.
 The `SIMPLE_ENGLISH_CONFIG` environment variable names an explicit path.
 Both forms work the same as in the hook.
 

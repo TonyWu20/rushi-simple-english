@@ -8,6 +8,7 @@ use crate::dictionaries;
 use crate::types::{Severity, Violation};
 
 use regex::Regex;
+use std::collections::HashSet;
 use std::sync::OnceLock;
 
 // ── Shared helpers ─────────────────────────────────────────────────────────
@@ -118,10 +119,16 @@ fn phrase_violations(
     entries: &[dictionaries::PhraseEntry],
     rule_id: &'static str,
     severity: Severity,
+    whitelist: &HashSet<String>,
 ) -> Vec<Violation> {
     let mut out = Vec::new();
     for entry in entries {
         for phrase in &entry.unapproved {
+            // A whitelisted form is never flagged. The set holds
+            // lowercased forms; the check is case-insensitive.
+            if whitelist.contains(&phrase.to_lowercase()) {
+                continue;
+            }
             for (line_no, col) in find_phrase(lines, phrase) {
                 let sugg = entry
                     .suggestions
@@ -142,29 +149,64 @@ fn phrase_violations(
     out
 }
 
-pub fn check_phrasal_verbs(lines: &[String], severity: Severity) -> Vec<Violation> {
+pub fn check_phrasal_verbs(
+    lines: &[String],
+    severity: Severity,
+    whitelist: &HashSet<String>,
+) -> Vec<Violation> {
     phrase_violations(
         lines,
         &dictionaries::phrasal_verbs(),
         "phrasal-verb",
         severity,
+        whitelist,
     )
 }
 
-pub fn check_hedging(lines: &[String], severity: Severity) -> Vec<Violation> {
-    phrase_violations(lines, &dictionaries::hedging(), "hedging", severity)
-}
-
-pub fn check_marketing(lines: &[String], severity: Severity) -> Vec<Violation> {
-    phrase_violations(lines, &dictionaries::marketing(), "marketing", severity)
-}
-
-pub fn check_ste_dictionary(lines: &[String], severity: Severity) -> Vec<Violation> {
+pub fn check_hedging(
+    lines: &[String],
+    severity: Severity,
+    whitelist: &HashSet<String>,
+) -> Vec<Violation> {
     phrase_violations(
         lines,
-        &dictionaries::ste_dictionary(),
+        &dictionaries::hedging(),
+        "hedging",
+        severity,
+        whitelist,
+    )
+}
+
+pub fn check_marketing(
+    lines: &[String],
+    severity: Severity,
+    whitelist: &HashSet<String>,
+) -> Vec<Violation> {
+    phrase_violations(
+        lines,
+        &dictionaries::marketing(),
+        "marketing",
+        severity,
+        whitelist,
+    )
+}
+
+/// `extra` holds project blacklist entries from the config. They are
+/// checked together with the built-in dictionary under the same rule.
+pub fn check_ste_dictionary(
+    lines: &[String],
+    severity: Severity,
+    extra: &[dictionaries::PhraseEntry],
+    whitelist: &HashSet<String>,
+) -> Vec<Violation> {
+    let mut entries = dictionaries::ste_dictionary();
+    entries.extend(extra.iter().cloned());
+    phrase_violations(
+        lines,
+        &entries,
         "dictionary-not-approved-word",
         severity,
+        whitelist,
     )
 }
 
@@ -296,7 +338,11 @@ mod tests {
 
     #[test]
     fn detects_phrasal_verb() {
-        let v = check_phrasal_verbs(&lines("We will carry out the plan."), Severity::Hard);
+        let v = check_phrasal_verbs(
+            &lines("We will carry out the plan."),
+            Severity::Hard,
+            &HashSet::new(),
+        );
         assert!(!v.is_empty());
         assert!(v[0].rule_id == "phrasal-verb");
     }
@@ -306,6 +352,7 @@ mod tests {
         let v = check_marketing(
             &lines("This is a seamless and powerful solution."),
             Severity::Soft,
+            &HashSet::new(),
         );
         assert!(v.len() >= 2);
     }
@@ -315,20 +362,31 @@ mod tests {
         let v = check_hedging(
             &lines("It is important to note that this is a test."),
             Severity::Soft,
+            &HashSet::new(),
         );
         assert!(!v.is_empty());
     }
 
     #[test]
     fn detects_ste_word() {
-        let v = check_ste_dictionary(&lines("We need to utilize this tool."), Severity::Hard);
+        let v = check_ste_dictionary(
+            &lines("We need to utilize this tool."),
+            Severity::Hard,
+            &[],
+            &HashSet::new(),
+        );
         assert!(!v.is_empty());
         assert!(v[0].rule_id == "dictionary-not-approved-word");
     }
 
     #[test]
     fn detects_provenance() {
-        let v = check_ste_dictionary(&lines("The provenance of the log entry."), Severity::Hard);
+        let v = check_ste_dictionary(
+            &lines("The provenance of the log entry."),
+            Severity::Hard,
+            &[],
+            &HashSet::new(),
+        );
         assert_eq!(v.len(), 1);
         assert_eq!(v[0].rule_id, "dictionary-not-approved-word");
         assert_eq!(v[0].suggestions, Some(vec!["origin".to_string()]));
@@ -336,10 +394,108 @@ mod tests {
 
     #[test]
     fn detects_ledger() {
-        let v = check_ste_dictionary(&lines("The ledger entry was updated."), Severity::Hard);
+        let v = check_ste_dictionary(
+            &lines("The ledger entry was updated."),
+            Severity::Hard,
+            &[],
+            &HashSet::new(),
+        );
         assert_eq!(v.len(), 1);
         assert_eq!(v[0].rule_id, "dictionary-not-approved-word");
         assert_eq!(v[0].suggestions, Some(vec!["log".to_string()]));
+    }
+
+    #[test]
+    fn detects_custom_blacklist_entry() {
+        // A word boundary blocks "quantize" from matching "quantizes",
+        // so the entry carries both forms.
+        let extra = [dictionaries::PhraseEntry {
+            unapproved: vec!["quantize".to_string(), "quantizes".to_string()],
+            suggestions: vec!["reduce".to_string()],
+        }];
+        let v = check_ste_dictionary(
+            &lines("The pipeline quantizes the tensor."),
+            Severity::Hard,
+            &extra,
+            &HashSet::new(),
+        );
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0].rule_id, "dictionary-not-approved-word");
+        assert_eq!(v[0].suggestions, Some(vec!["reduce".to_string()]));
+    }
+
+    #[test]
+    fn custom_blacklist_entry_without_suggestion_defaults_to_delete() {
+        let extra = [dictionaries::PhraseEntry {
+            unapproved: vec!["voodoo".to_string()],
+            suggestions: Vec::new(),
+        }];
+        let v = check_ste_dictionary(
+            &lines("No voodoo here."),
+            Severity::Hard,
+            &extra,
+            &HashSet::new(),
+        );
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0].suggestions, Some(vec!["delete".to_string()]));
+    }
+
+    #[test]
+    fn whitelist_suppresses_builtin_word() {
+        let set: HashSet<String> = HashSet::from(["utilize".to_string()]);
+        let v = check_ste_dictionary(
+            &lines("We need to utilize this tool."),
+            Severity::Hard,
+            &[],
+            &set,
+        );
+        assert!(v.is_empty());
+    }
+
+    #[test]
+    fn whitelist_suppresses_custom_entry() {
+        let extra = [dictionaries::PhraseEntry {
+            unapproved: vec!["quantize".to_string(), "quantizes".to_string()],
+            suggestions: vec!["reduce".to_string()],
+        }];
+        let v = check_ste_dictionary(
+            &lines("The pipeline quantizes the tensor."),
+            Severity::Hard,
+            &extra,
+            &HashSet::new(),
+        );
+        assert_eq!(v.len(), 1);
+
+        let set: HashSet<String> = HashSet::from(["quantizes".to_string()]);
+        let v = check_ste_dictionary(
+            &lines("The pipeline quantizes the tensor."),
+            Severity::Hard,
+            &extra,
+            &set,
+        );
+        assert!(v.is_empty());
+    }
+
+    #[test]
+    fn whitelist_does_not_suppress_other_forms() {
+        // Only the exact form "utilize" is whitelisted. The inflected
+        // form "utilizes" still fires.
+        let set: HashSet<String> = HashSet::from(["utilize".to_string()]);
+        let v = check_ste_dictionary(&lines("He utilizes the tool."), Severity::Hard, &[], &set);
+        assert_eq!(v.len(), 1);
+    }
+
+    #[test]
+    fn whitelist_suppresses_phrasal_verb() {
+        let set: HashSet<String> = HashSet::from(["kick off".to_string()]);
+        let v = check_phrasal_verbs(&lines("We will kick off the plan."), Severity::Hard, &set);
+        assert!(v.is_empty());
+        let v = check_phrasal_verbs(
+            &lines("We will kick off the plan."),
+            Severity::Hard,
+            &HashSet::new(),
+        );
+        assert!(!v.is_empty());
     }
 
     #[test]

@@ -1,6 +1,7 @@
 //! Core types for the simple-english hook.
 
-use std::collections::BTreeMap;
+use crate::dictionaries::PhraseEntry;
+use std::collections::{BTreeMap, HashSet};
 
 /// Severity of a rule violation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -63,6 +64,16 @@ pub enum LintKind {
 /// Per-rule setting: severity or off.
 pub type RuleSetting = Option<Severity>;
 
+/// Project whitelist: word and phrase forms that are never flagged.
+/// Applies to every phrase-list rule: the STE dictionary, phrasal
+/// verbs, hedging, and marketing. Matching is case-insensitive.
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+pub struct Whitelist {
+    /// Exact approved word or phrase forms.
+    #[serde(default)]
+    pub words: Vec<String>,
+}
+
 /// Configuration for the lint engine.
 #[derive(Debug, Clone, Default, serde::Deserialize)]
 pub struct LintConfig {
@@ -80,9 +91,24 @@ pub struct LintConfig {
     /// Whether to exempt block-quoted content from linting.
     #[serde(default)]
     pub exempt_block_quotes: bool,
+    /// Additional project blacklisted phrases. Each entry is checked
+    /// under the `dictionary-not-approved-word` rule.
+    #[serde(default)]
+    pub blacklist: Vec<PhraseEntry>,
+    /// Project-approved word and phrase forms. Never flagged.
+    #[serde(default)]
+    pub whitelist: Whitelist,
 }
 
 impl LintConfig {
+    /// Whitelisted forms, lowercased for case-insensitive matching.
+    pub fn whitelist_set(&self) -> HashSet<String> {
+        self.whitelist
+            .words
+            .iter()
+            .map(|w| w.to_lowercase())
+            .collect()
+    }
     /// Resolve the effective setting for a rule, falling back to defaults.
     pub fn resolve_rule(&self, rule_id: &str) -> RuleSetting {
         if let Some(setting) = self.rules.get(rule_id) {

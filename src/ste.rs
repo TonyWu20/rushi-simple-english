@@ -43,7 +43,7 @@ Options:
 The report goes to stdout. Errors and notes go to stderr.
 Exit codes: 0 = clean, 1 = violations found, 2 = usage or input error.
 
-Config: .simple-english.json in the cwd or $SIMPLE_ENGLISH_CONFIG.";
+Config: .simple-english.toml in the cwd or $SIMPLE_ENGLISH_CONFIG.";
 
 /// Parsed CLI arguments.
 #[derive(Debug)]
