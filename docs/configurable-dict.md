@@ -55,7 +55,7 @@ ignored. The README records the migration.
   ends the top-level scope at the header. The README and the
   config test note the rule.
 - `cargo add toml` refreshed `Cargo.lock` for the whole tree.
-- The version stays 0.5.0. That is the in-development version
-  behind the CLI feature. This feature joins it.
+- The version moves 0.5.0 to 0.6.0. A new capability is a
+  semver minor bump. The user set it, 2026-10-21.
 
 (exit code 0)
