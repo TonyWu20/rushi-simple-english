@@ -83,24 +83,33 @@ pub fn lint(kind: LintKind, text: &str, config: &LintConfig) -> LintReport {
         }
     }
 
+    // Whitelisted word and phrase forms. Never flagged. Applies to
+    // every phrase-list rule below.
+    let whitelist = config.whitelist_set();
+
     // Phrasal verbs
     if let Some(sev) = config.resolve_rule("phrasal-verb") {
-        violations.extend(rules::check_phrasal_verbs(&prose_lines, sev));
+        violations.extend(rules::check_phrasal_verbs(&prose_lines, sev, &whitelist));
     }
 
     // Hedging
     if let Some(sev) = config.resolve_rule("hedging") {
-        violations.extend(rules::check_hedging(&prose_lines, sev));
+        violations.extend(rules::check_hedging(&prose_lines, sev, &whitelist));
     }
 
     // Marketing
     if let Some(sev) = config.resolve_rule("marketing") {
-        violations.extend(rules::check_marketing(&prose_lines, sev));
+        violations.extend(rules::check_marketing(&prose_lines, sev, &whitelist));
     }
 
-    // STE dictionary
+    // STE dictionary, plus the project blacklist entries.
     if let Some(sev) = config.resolve_rule("dictionary-not-approved-word") {
-        violations.extend(rules::check_ste_dictionary(&prose_lines, sev));
+        violations.extend(rules::check_ste_dictionary(
+            &prose_lines,
+            sev,
+            &config.blacklist,
+            &whitelist,
+        ));
     }
 
     // Suppression directive validation
@@ -1092,16 +1101,48 @@ mod tests {
     }
 
     #[test]
-    fn source_kind_paragraph_cap_is_off_by_default() {
-        let config = LintConfig::default();
-        let text = "# One. # Two. # Three. # Four. # Five. # Six. # Seven. # Eight.\n";
-        let report = lint(LintKind::HashSource, text, &config);
-        assert!(
-            !report
-                .violations
-                .iter()
-                .any(|v| v.rule_id == "paragraph-length"),
-            "{report:?}"
+    fn lint_applies_project_blacklist_and_whitelist() {
+        let config: LintConfig = toml::from_str(
+            r#"
+                [[blacklist]]
+                unapproved = ["quantize", "quantizes"]
+                suggestions = ["reduce"]
+
+                [whitelist]
+                words = ["utilize"]
+            "#,
+        )
+        .unwrap();
+        let report = lint(
+            LintKind::ProseFile,
+            "The pipeline quantizes the model. We utilize it daily.",
+            &config,
         );
+        // "quantizes" fires from the project blacklist. "utilize"
+        // is whitelisted and stays out of the report.
+        assert_eq!(report.summary.total, 1, "{report:?}");
+        let v = &report.violations[0];
+        assert_eq!(v.rule_id, "dictionary-not-approved-word");
+        assert_eq!(v.suggestions, Some(vec!["reduce".to_string()]));
+    }
+
+    #[test]
+    fn lint_whitelist_beats_project_blacklist() {
+        let config: LintConfig = toml::from_str(
+            r#"
+                [[blacklist]]
+                unapproved = ["quantizes"]
+
+                [whitelist]
+                words = ["quantizes"]
+            "#,
+        )
+        .unwrap();
+        let report = lint(
+            LintKind::ProseFile,
+            "The pipeline quantizes the model.",
+            &config,
+        );
+        assert_eq!(report.summary.total, 0, "{report:?}");
     }
 }

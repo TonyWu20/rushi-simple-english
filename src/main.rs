@@ -843,7 +843,7 @@ fn print_help() {
         "run.idle gate effect: appends a follow-up user_message to the session log via LOG_BIN"
     );
     println!();
-    println!("Config: .simple-english.json in cwd or $SIMPLE_ENGLISH_CONFIG");
+    println!("Config: .simple-english.toml in cwd or $SIMPLE_ENGLISH_CONFIG");
     println!("Standalone checker: rushi-ste [FILE] - see docs/cli.md");
 }
 

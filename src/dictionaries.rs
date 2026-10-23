@@ -1,9 +1,12 @@
 //! Embedded dictionary data ported from jyooi/agent-simple-english.
 
 /// A set of unapproved words or phrases with suggested replacements.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Deserialize)]
 pub struct PhraseEntry {
     pub unapproved: Vec<String>,
+    /// Suggested approved replacements. Optional in a project config
+    /// entry; when empty the check suggests "delete".
+    #[serde(default)]
     pub suggestions: Vec<String>,
 }
 

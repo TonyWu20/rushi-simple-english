@@ -48,21 +48,45 @@ period-free comment lines must not grow into one giant sentence.
 
 ## Config
 
-Place `.simple-english.json` in the project root or set
-`$SIMPLE_ENGLISH_CONFIG` to a config path.
+Place `.simple-english.toml` in the project root or set
+`$SIMPLE_ENGLISH_CONFIG` to a config path. A file that does not
+parse falls back to the defaults.
 
-```json
-{
-  "rules": { "semicolon": "soft" },
-  "max_sentence_words": 20,
-  "max_paragraph_sentences": 8,
-  "exempt_block_quotes": true
-}
+Top-level keys must sit before the first table header. A header
+ends the top-level scope for the rest of the file.
+
+```toml
+max_sentence_words = 20
+max_paragraph_sentences = 8
+exempt_block_quotes = true
+
+[rules]
+semicolon = "soft"
+
+[[blacklist]]
+unapproved = ["utilize", "utilizes", "utilized", "utilizing"]
+suggestions = ["use"]
+
+[whitelist]
+words = ["kick off"]
 ```
 
-Set `max_paragraph_sentences` to change the paragraph cap.
-Use 0 to turn the rule off.
-Prose kinds default to 6. Source kinds default off.
+Key behavior:
+
+- `rules`: per-rule overrides. Values are `hard`, `soft`, or `off`.
+- `max_paragraph_sentences`: the paragraph cap. A value of 0 turns
+  the rule off. Prose kinds default to 6. Source kinds default off.
+- `[[blacklist]]`: extra banned words and phrases. Each entry is
+  checked under the `dictionary-not-approved-word` rule. The
+  `unapproved` list is required. `suggestions` is optional. When
+  omitted, the suggested fix is `delete`.
+- `[whitelist]`: `words` names exact forms that never get flagged.
+  Matching is case-insensitive. It applies to every phrase-list
+  rule: the STE dictionary, phrasal verbs, hedging, marketing.
+  It covers project blacklist entries too.
+
+Migration: the hook no longer reads `.simple-english.json`.
+Move its keys to the TOML file. The key names stay the same.
 
 ## Bash write post-check (`tool.after`)
 

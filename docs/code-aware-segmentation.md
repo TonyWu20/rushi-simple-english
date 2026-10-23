@@ -24,7 +24,7 @@ Shell scripts and commit messages tripped `paragraph-length` and
 
 1. `extract_hash_comments` skips shebang lines.
 2. The paragraph cap is configurable. The `max_paragraph_sentences`
-   key in `.simple-english.json` sets it. A value of 0 turns the
+   key in `.simple-english.toml` sets it. A value of 0 turns the
    rule off.
 
 The `#!` shebang guard sits in `sentence_ends`. It covers the prose
