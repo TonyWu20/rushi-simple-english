@@ -26,15 +26,23 @@
 //!   `request.prompt_fragments`. The fragment is static, so the cached
 //!   prompt prefix survives. Gate feedback no longer rides this
 //!   transform. It is a logged follow-up user message from `run.idle`.
-//! - **`run.idle`** — lints the last assistant reply. When hard
-//!   violations are found, the loop is continued with a logged
-//!   follow-up user message that lists the violations and asks the
-//!   model to re-send the complete reply, in full, with every
-//!   flagged issue fixed. The model produces a full clean revision
-//!   within the same run. The hook's `gate_count` is
-//!   bounded by `MAX_GATE_COUNT`, so a model that keeps producing the
-//!   same bad reply stops the chain. The lint result is written to a
-//!   state file that the TUI status widget reads.
+//! - **`run.idle`** — lints the last assistant reply. The reply
+//!   read goes through the kernel's shared reader
+//!   (`rushi_common::logstream`, the consumer contract of
+//!   kernel `docs/session-log-compression.md`, FT-005): the
+//!   indexed tail read (`tail_lines`) when the frame index
+//!   validates, the no-index window scan (`read_log_tail`) for
+//!   plain and pre-P8 logs, and the full read (`read_log_text`)
+//!   when the reply sits past the window. When hard violations
+//!   are found,
+//!   the loop is continued with a logged follow-up user message
+//!   that lists the violations and asks the model to re-send the
+//!   complete reply, in full, with every flagged issue fixed. The
+//!   model produces a full clean revision within the same run. The
+//!   hook's `gate_count` is bounded by `MAX_GATE_COUNT`, so a model
+//!   that keeps producing the same bad reply stops the chain. The
+//!   lint result is written to a state file that the TUI status
+//!   widget reads.
 //!
 //! ## Protocol (pipeline ABI, docs/loop-lifecycle-hooks.md §12)
 //!
@@ -62,7 +70,9 @@
 //!   drains it as a new turn. A clean reply or a capped gate appends
 //!   nothing. An append failure is a step-level failure (exit 3);
 //!   the window resolves to its default (stop) and the loop never
-//!   wedges.
+//!   wedges. An unreadable session log fails the same way: exit 3
+//!   with a `reason` payload, and the kernel logs
+//!   `hook.run.idle.error` with the detail (FT-005).
 //!
 //! Exit codes: 0 = ok, 2 = abort (veto the window default, sticky),
 //! 3 = fail (the window resolves to its default).
@@ -528,9 +538,14 @@ fn is_request_object(v: &serde_json::Value) -> bool {
 ///   new model turn, so the model revises the gated reply within the
 ///   same run. The transcript keeps a normal user/assistant
 ///   alternation.
-/// - Prints `{}` either way; on a clean reply or a capped gate no
-///   message is appended. An append failure is a step-level failure:
-///   the hook exits 3 and the window resolves to its default (stop).
+/// - Prints `{}` on the success paths; on a clean reply or a
+///   capped gate no message is appended. An append failure is a
+///   step-level failure: the hook exits 3 and the window resolves
+///   to its default (stop).
+/// - An unreadable session log (FT-005) is a step-level failure
+///   too: the hook exits 3 with a `reason` payload, the kernel
+///   logs `hook.run.idle.error`, and the window resolves to its
+///   default (stop). The gate never runs blind.
 fn handle_run_idle(payload: &serde_json::Value) {
     let session_dir = match resolve_session_dir(payload) {
         Some(d) => d,
@@ -540,28 +555,59 @@ fn handle_run_idle(payload: &serde_json::Value) {
         }
     };
 
-    if let Some(message) = run_idle_decision(&session_dir, &config::load_config()) {
-        if let Err(e) = append_follow_up_user_message(&session_dir, &message) {
-            eprintln!("[simple-english] {e}");
-            // A failed append is a step-level failure: the window
+    match run_idle_decision(&session_dir, &config::load_config()) {
+        Ok(Some(message)) => {
+            if let Err(e) = append_follow_up_user_message(&session_dir, &message) {
+                eprintln!("[simple-english] {e}");
+                // A failed append is a step-level failure: the window
+                // resolves to its default (stop) and the loop never
+                // wedges. The `reason` rides into the kernel's
+                // `fail(<reason>)` chain marker.
+                println!("{}", json!({ "reason": format!("append follow-up: {e}") }));
+                std::process::exit(3);
+            }
+        }
+        // Clean reply or gate cap reached: let the loop stop.
+        Ok(None) => {}
+        Err(detail) => {
+            // The log exists but cannot be read (FT-005). The gate
+            // must not run blind: fail the step so the kernel logs
+            // `hook.run.idle.error` with the detail. The window
             // resolves to its default (stop) and the loop never
             // wedges.
-            println!("{}", json!({}));
+            eprintln!("[simple-english] {detail}");
+            println!("{}", json!({ "reason": detail }));
             std::process::exit(3);
         }
-    } // Clean reply or gate cap reached: let the loop stop.
+    }
     println!("{}", json!({}));
 }
 
 /// Compute the `run.idle` decision for one session and persist the
 /// updated state file. Pure w.r.t. stdout so it is unit-testable.
 ///
-/// Returns the follow-up `user_message` content to append on a gated
-/// reply, or `None` when nothing is appended (clean reply, already
-/// gated, or the gate cap is reached).
-fn run_idle_decision(session_dir: &Path, config: &types::LintConfig) -> Option<String> {
+/// `Ok(Some(message))` is the follow-up `user_message` content to
+/// append on a gated reply. `Ok(None)` means nothing is appended
+/// (clean reply, already gated, the gate cap is reached, or no
+/// reply to lint yet). `Err(detail)` means the session log exists
+/// but cannot be read; the caller fails the step so the kernel logs
+/// the detail on `hook.run.idle.error`.
+fn run_idle_decision(
+    session_dir: &Path,
+    config: &types::LintConfig,
+) -> Result<Option<String>, String> {
     // Read the last assistant message with non-empty content.
-    let reply_text = reply::read_last_assistant_message(session_dir)?;
+    let reply_text = match reply::read_last_assistant_message(session_dir) {
+        Ok(Some(text)) => text,
+        // No log yet, or no assistant content: nothing to gate.
+        Ok(None) => return Ok(None),
+        Err(e) => {
+            return Err(format!(
+                "cannot read {}: {e}; the reply gate skips this reply",
+                session_dir.join("events.jsonl").display()
+            ));
+        }
+    };
 
     let report = engine::lint(LintKind::ProseFile, &reply_text, config);
 
@@ -639,7 +685,7 @@ fn run_idle_decision(session_dir: &Path, config: &types::LintConfig) -> Option<S
         // drains it as a new turn. The hook's gate_count (bounded by
         // MAX_GATE_COUNT) stops the chain when the model keeps
         // producing the same bad reply.
-        return Some(message);
+        return Ok(Some(message));
     }
 
     // Clean reply, or the gate cap is reached: allow the stop.
@@ -648,7 +694,7 @@ fn run_idle_decision(session_dir: &Path, config: &types::LintConfig) -> Option<S
         state.gate_count = 0;
     }
     let _ = reply::save_state(session_dir, &state);
-    None
+    Ok(None)
 }
 
 /// Append a follow-up `user_message` to the session log through the
@@ -1034,7 +1080,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         seed_session(dir.path(), "One. Two. Three. Four. Five. Six. Seven.");
         let config = types::LintConfig::default();
-        let resp = run_idle_decision(dir.path(), &config);
+        let resp = run_idle_decision(dir.path(), &config).unwrap();
         let message = resp.as_deref().unwrap();
         assert!(message.contains("Hard violations"), "{message}");
         assert!(message.contains("writing-rule violation"));
@@ -1052,7 +1098,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         seed_session(dir.path(), "One. Two. Three. Four. Five. Six. Seven.");
         let config = types::LintConfig::default();
-        let message = run_idle_decision(dir.path(), &config).unwrap();
+        let message = run_idle_decision(dir.path(), &config).unwrap().unwrap();
         // The reply body is not re-shown. Only the violation list
         // points at the flagged locations.
         assert!(
@@ -1087,7 +1133,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         seed_session(dir.path(), "The fix is complete.");
         let config = types::LintConfig::default();
-        let resp = run_idle_decision(dir.path(), &config);
+        let resp = run_idle_decision(dir.path(), &config).unwrap();
         assert!(resp.is_none(), "a clean reply appends nothing");
         let state = reply::load_state(dir.path()).unwrap();
         assert_eq!(state.hard, 0);
@@ -1103,9 +1149,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         seed_session(dir.path(), "One. Two. Three. Four. Five. Six. Seven.");
         let config = types::LintConfig::default();
-        let first = run_idle_decision(dir.path(), &config);
+        let first = run_idle_decision(dir.path(), &config).unwrap();
         assert!(first.is_some(), "the first firing gates the reply");
-        let second = run_idle_decision(dir.path(), &config);
+        let second = run_idle_decision(dir.path(), &config).unwrap();
         assert!(second.is_none(), "the re-fire must not re-gate");
         let state = reply::load_state(dir.path()).unwrap();
         assert_eq!(state.gate_count, 1, "the re-fire must not re-gate");
@@ -1123,7 +1169,7 @@ mod tests {
         let mut gated = Vec::new();
         let mut n = 1;
         for _ in 0..5 {
-            let d = run_idle_decision(dir.path(), &config);
+            let d = run_idle_decision(dir.path(), &config).unwrap();
             gated.push(d.is_some());
             if d.is_some() {
                 // The continued model turn produces a new reply that

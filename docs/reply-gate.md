@@ -18,7 +18,19 @@ alternation.
 
 ## Delivery path
 
-1. `run.idle` lints the last assistant reply.
+1. `run.idle` lints the last assistant reply. The log read goes
+   through the kernel's shared reader (kernel
+   `docs/session-log-compression.md`, the consumer contract).
+   The gate wants one event at the tail.
+   It pays the cheapest tier that can hold it:
+   - the indexed tail read (`tail_lines`, 128 lines): it
+     decodes only the record ranges at the tail, when the
+     frame index sidecar validates.
+   - the no-index window scan (`read_log_tail`, a 1 MiB
+     stream budget): plain legacy logs and pre-P8 streams.
+   - the full read (`read_log_text`): the reply sits past the
+     window, or the tail read degraded.
+   The hook never copies the layout logic itself.
 2. On hard violations (and the gate cap is not reached), the hook
    appends a `user_message` event to the session log via
    `"$LOG_BIN" --session "$SESSION"`. The event carries
@@ -33,7 +45,10 @@ alternation.
 4. An append failure (e.g. `LOG_BIN` missing) is a step-level
    failure: the hook exits 3, the kernel logs
    `hook.run.idle.error`, the window resolves to its default
-   (stop), and the loop never wedges.
+   (stop), and the loop never wedges. An unreadable session log
+   fails the same way: the hook exits 3 with a `reason` payload
+   and the kernel logs the detail (FT-005). The gate never runs
+   blind.
 5. The revised reply is linted on the next `run.idle`. A clean
    reply settles the gate and turns the row green. A new violating
    reply gates again, as a new logged follow-up.

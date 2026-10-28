@@ -81,11 +81,65 @@ pub fn save_state(dir: &Path, state: &ReplyState) -> std::io::Result<()> {
     fs::write(state_path(dir), raw)
 }
 
+/// How many text lines the indexed tail read decodes (the P8
+/// consumer path). The window must reach back past the last
+/// `assistant_message` with content. Lines after it are bounded:
+/// the idle markers land after the pipeline, and a gate chain adds
+/// at most `MAX_GATE_COUNT` user-plus-assistant pairs. A miss is
+/// safe: it escalates to the full read.
+const TAIL_LINES: usize = 128;
+
+/// The stream-byte budget of the no-index window scan (a plain
+/// legacy log, or a pre-P8 zstd stream). A reply longer than the
+/// budget truncates to a non-parsing line, the scan misses, and
+/// the full read decides.
+const TAIL_BYTE_BUDGET: u64 = 1_048_576;
+
 /// Read the last `assistant_message` with non-empty `content` from
-/// `<session>/events.jsonl`. Scans from the tail for efficiency.
-pub fn read_last_assistant_message(dir: &Path) -> Option<String> {
-    let raw = fs::read_to_string(dir.join("events.jsonl")).ok()?;
-    for line in raw.lines().rev() {
+/// `<session>/events.jsonl`. The read goes through the kernel's
+/// shared reader (kernel `docs/session-log-compression.md`, the
+/// consumer contract). The gate only wants one event at the tail,
+/// so it pays the cheapest tier that can hold it:
+///
+/// 1. the indexed tail read (`tail_lines`): with the frame index
+///    sidecar, decodes only the record ranges at the tail;
+/// 2. the no-index window scan (`read_log_tail`): the last budget
+///    bytes, for plain legacy logs and pre-P8 streams;
+/// 3. the full read (`read_log_text`): the reply sits past the
+///    window, or the tail read degraded. Its error fails the step
+///    (FT-005): the gate never runs blind.
+///
+/// `Ok(None)` when the log is absent (a fresh session, no reply
+/// yet) or holds no assistant message with content.
+pub fn read_last_assistant_message(dir: &Path) -> Result<Option<String>, std::io::Error> {
+    let path = dir.join("events.jsonl");
+    let stream = match rushi_common::logstream::open_indexed(&path) {
+        Ok(s) => s,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e),
+    };
+
+    let window = if stream.has_index() {
+        stream.tail_lines(TAIL_LINES).join("\n")
+    } else {
+        // No index (a plain legacy log, or a pre-P8 stream): the
+        // no-index window scan. The coverage flag is not needed: a
+        // miss or a degraded read escalates to the full read.
+        rushi_common::logstream::read_log_tail(&path, TAIL_BYTE_BUDGET)?.0
+    };
+    if let Some(reply) = last_assistant_in_text(&window) {
+        return Ok(Some(reply));
+    }
+
+    let full = rushi_common::logstream::read_log_text(&path)?;
+    Ok(last_assistant_in_text(&full))
+}
+
+/// The last `assistant_message` with non-empty `content` in a
+/// decoded log text. Lines are JSONL events. A torn first line of
+/// a window is not valid JSON, and it skips.
+fn last_assistant_in_text(text: &str) -> Option<String> {
+    for line in text.lines().rev() {
         let line = line.trim();
         if line.is_empty() {
             continue;
@@ -132,7 +186,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            read_last_assistant_message(dir.path()).as_deref(),
+            read_last_assistant_message(dir.path()).unwrap().as_deref(),
             Some("hello there")
         );
     }
@@ -141,13 +195,151 @@ mod tests {
     fn read_last_assistant_message_none_when_no_content() {
         let dir = tempfile::tempdir().unwrap();
         fs::write(dir.path().join("events.jsonl"), "{}\n").unwrap();
-        assert_eq!(read_last_assistant_message(dir.path()), None);
+        assert_eq!(read_last_assistant_message(dir.path()).unwrap(), None);
     }
 
     #[test]
     fn read_last_assistant_message_no_file() {
         let dir = tempfile::tempdir().unwrap();
-        assert_eq!(read_last_assistant_message(dir.path()), None);
+        assert_eq!(
+            read_last_assistant_message(dir.path()).unwrap(),
+            None,
+            "an absent log means no reply yet, not an error"
+        );
+    }
+
+    /// One zstd frame per kernel log line: `LogLine::commit`
+    /// compresses the line bytes (newline-terminated) into one
+    /// frame and appends it.
+    fn zstd_stream(dir: &Path, lines: &[&str]) {
+        let frames: Vec<u8> = lines
+            .iter()
+            .map(|l| rushi_common::logstream::compress_frame(l.as_bytes()).unwrap())
+            .collect::<Vec<Vec<u8>>>()
+            .into_iter()
+            .flatten()
+            .collect();
+        fs::write(dir.join("events.jsonl"), frames).unwrap();
+    }
+
+    /// One frame-index sidecar record per frame.
+    fn write_index(dir: &Path, lines: &[&str]) {
+        use rushi_common::logstream::{IndexRecord, encode_index, index_path};
+        let mut records = Vec::new();
+        let mut offset = 0u64;
+        for (pos, line) in lines.iter().enumerate() {
+            let frame = rushi_common::logstream::compress_frame(line.as_bytes()).unwrap();
+            records.push(IndexRecord {
+                seq_start: pos as u64 + 1,
+                frame_offset: offset,
+                frame_len: frame.len() as u64,
+                text_len: line.len() as u64,
+            });
+            offset += frame.len() as u64;
+        }
+        fs::write(
+            index_path(&dir.join("events.jsonl")),
+            encode_index(&records),
+        )
+        .unwrap();
+    }
+
+    /// Newline-terminated event lines, as the kernel commits them.
+    fn event_lines(user: &str, asst: &str) -> Vec<String> {
+        vec![user.to_string() + "\n", asst.to_string() + "\n"]
+    }
+
+    #[test]
+    fn read_last_assistant_message_reads_zstd_stream() {
+        // A zstd frame stream without the index sidecar takes the
+        // no-index window scan. Plain legacy logs take the same
+        // path, so the pre-zstd behavior is unchanged.
+        let dir = tempfile::tempdir().unwrap();
+        let user = r#"{"v":1,"type":"user_message","ts":"t","seq":1,"content":"do the task"}"#;
+        let asst =
+            r#"{"v":1,"type":"assistant_message","ts":"t","seq":2,"content":"You're done."}"#;
+        let lines = event_lines(user, asst);
+        zstd_stream(
+            dir.path(),
+            &lines.iter().map(|l| l.as_str()).collect::<Vec<&str>>(),
+        );
+        assert_eq!(
+            read_last_assistant_message(dir.path()).unwrap().as_deref(),
+            Some("You're done.")
+        );
+    }
+
+    #[test]
+    fn read_last_assistant_message_reads_indexed_tail() {
+        // The P8 consumer path: with the frame index sidecar, the
+        // read decodes only the record ranges at the tail.
+        let dir = tempfile::tempdir().unwrap();
+        let user = r#"{"v":1,"type":"user_message","ts":"t","seq":1,"content":"do the task"}"#;
+        let asst =
+            r#"{"v":1,"type":"assistant_message","ts":"t","seq":2,"content":"You're done."}"#;
+        let lines = event_lines(user, asst);
+        let refs: Vec<&str> = lines.iter().map(|l| l.as_str()).collect();
+        zstd_stream(dir.path(), &refs);
+        write_index(dir.path(), &refs);
+        assert_eq!(
+            read_last_assistant_message(dir.path()).unwrap().as_deref(),
+            Some("You're done.")
+        );
+    }
+
+    #[test]
+    fn read_last_assistant_message_escapes_past_the_tail_window() {
+        // The reply sits past the indexed tail window (more than
+        // `TAIL_LINES` lines back). The tail read misses. The
+        // full read decides, and finds the reply.
+        let dir = tempfile::tempdir().unwrap();
+        let user = r#"{"v":1,"type":"user_message","ts":"t","seq":1,"content":"do the task"}"#;
+        let asst =
+            r#"{"v":1,"type":"assistant_message","ts":"t","seq":2,"content":"You're done."}"#;
+        let mut lines = event_lines(user, asst);
+        for i in 0..(super::TAIL_LINES + 32) {
+            lines.push(format!(
+                "{{\"id\":\"ext{0}\",\"ts\":\"t\",\"type\":\"ext_status\",\"v\":1,\"value\":\"x\"}}\n",
+                i
+            ));
+        }
+        let refs: Vec<&str> = lines.iter().map(|l| l.as_str()).collect();
+        zstd_stream(dir.path(), &refs);
+        write_index(dir.path(), &refs);
+        assert_eq!(
+            read_last_assistant_message(dir.path()).unwrap().as_deref(),
+            Some("You're done.")
+        );
+    }
+
+    #[test]
+    fn read_last_assistant_message_grown_past_its_index() {
+        // A stream that grew past its index (a commit after the
+        // last index write) drops the indexed tail. The read falls
+        // back and still finds the reply.
+        let dir = tempfile::tempdir().unwrap();
+        let user = r#"{"v":1,"type":"user_message","ts":"t","seq":1,"content":"do the task"}"#;
+        let lines = event_lines(user, "");
+        let refs: Vec<&str> = lines.iter().map(|l| l.as_str()).collect();
+        zstd_stream(dir.path(), &refs);
+        write_index(dir.path(), &refs);
+        // A fresh model turn: the reply frame lands after the
+        // index end.
+        let asst =
+            r#"{"v":1,"type":"assistant_message","ts":"t","seq":2,"content":"You're done."}"#;
+        let frame =
+            rushi_common::logstream::compress_frame((asst.to_string() + "\n").as_bytes()).unwrap();
+        use std::io::Write;
+        fs::OpenOptions::new()
+            .append(true)
+            .open(dir.path().join("events.jsonl"))
+            .unwrap()
+            .write_all(&frame)
+            .unwrap();
+        assert_eq!(
+            read_last_assistant_message(dir.path()).unwrap().as_deref(),
+            Some("You're done.")
+        );
     }
 
     #[test]

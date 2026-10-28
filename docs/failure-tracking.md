@@ -288,3 +288,82 @@ FT-002 and FT-003 misread path does not apply.
 `cargo test` passes. The test
 `run_idle_message_requests_full_clean_reply` asserts that the
 message requests the full reply and keeps the guard sentences.
+
+## FT-005 — Reply gate goes dark: the zstd log broke the plain-text read
+
+**Symptom**
+Session `rushi-config/sessions/simplify-flake.nix`, the
+`assistant_message` at `2026-10-28T03:41:30Z`.
+The reply carried hard writing-rule violations.
+The `run.idle` gate appended no correction.
+The `hook.run.idle.chain` marker held `["noop","noop"]`, and
+the loop stopped on the default.
+
+No `simple-english-state.json` ever reached the session dir.
+The `model.before` `hook_applied` markers kept logging, so
+the transform side looked healthy while the gate side was
+dead.
+
+**Root cause**
+The kernel switch made the session log a zstd frame stream.
+The frame index sidecar and the shared tail reader shipped
+in `rushi-common` 0.1.8.
+`read_last_assistant_message` still called `fs::read_to_string`
+on `events.jsonl`.
+A zstd stream is not valid UTF-8. The read returned `Err`.
+The `?` folded that into `None`.
+
+The gate read `None` as "no reply to lint" and let the loop
+stop.
+No marker, no state file, no correction. The failure stayed
+invisible for a week.
+
+The compression spec names the consumer contract. It says to
+read the log through `rushi_common::logstream`, the shared
+reader. This repo never took the consumer follow-up.
+
+**Fix**
+2026-10-28. `read_last_assistant_message` now reads through the
+kernel's shared reader. The gate wants one event at the tail, so
+the read pays the cheapest tier that can hold it:
+
+1. the indexed tail read (`tail_lines`, 128 lines): with the
+   frame index sidecar, it decodes only the record ranges at
+   the tail.
+2. the no-index window scan (`read_log_tail`, a 1 MiB stream
+   budget): for plain legacy logs and pre-P8 streams.
+3. the full read (`read_log_text`): the reply sits past the
+   window, or the tail read degraded. Its error fails the step
+   (exit 3, a `reason` payload, and
+   `hook.run.idle.error` in the log). The gate never runs blind.
+
+A missing log still means "no reply yet". The hook crate gains
+one dependency: `rushi-common` 0.1.8, the release that carries
+`logstream`.
+
+**Verification**
+`cargo test` passes 174 tests. The new tests cover the
+indexed tail read and the no-index zstd stream.
+They also cover the reply past the tail window (the full read
+decides) and a stream grown past its index.
+`scripts/reply-gate-e2e.sh` passes 17/17 on the plain-text
+path.
+A `run.idle` run on a copy of the real evidence session (a zstd
+stream with its frame index) lints the clean reply and appends
+nothing. After one appended violating `assistant_message`
+frame, the gate fires: the correction lands through `LOG_BIN`
+and the state file records `gate_count = 1`.
+
+`cargo test` passes 172 tests. The new test
+`read_last_assistant_message_reads_zstd_stream` builds a
+two-frame zstd stream with the kernel's own
+`compress_frame` and reads the reply back.
+`read_last_assistant_message_unreadable_log_is_an_error`
+asserts the failure path.
+
+A direct `run.idle` run against the real evidence session
+(now a zstd stream) gates the reply and appends the
+correction through `LOG_BIN`. The state file lands with
+`gate_count = 1`.
+`scripts/reply-gate-e2e.sh` passes 17/17 on the plain-text
+path.
